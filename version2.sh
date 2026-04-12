@@ -59,7 +59,7 @@ deep_repair() {
             ;;
         "AMD")
             echo "Installing AMD ROCm dependencies..." | tee -a "$LOG_FILE"
-            sudo apt-get update && sudo apt-get install -y libnuma-dev wget gnupg2
+            sudo apt-get update && sudo apt-get install -y libnuma-dev wget gnupg2 rocm-opencl-runtime rocm-hip-sdk
             sudo apt-get install -y "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)"
             ;;
         "INTEL")
