@@ -1,5 +1,7 @@
 #!/bin/bash
-set -euo pipefail
+# Dropped global 'set -e' to prevent interactive menu crashes on minor errors.
+# Kept 'set -uo pipefail' for safe variable and pipe handling.
+set -uo pipefail
 
 # --- Styling ---
 B_RED='\033[1;31m'
@@ -21,7 +23,7 @@ KEY_FILE="$HOME/llama_api_keys.log"
 rotate_log() {
     if [[ -f "$LOG_FILE" ]]; then
         local lines
-        lines=$(wc -l < "$LOG_FILE")
+        lines=$(wc -l < "$LOG_FILE" || echo 0)
         if (( lines > 500 )); then
             tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
         fi
@@ -31,7 +33,7 @@ rotate_log() {
 
 draw_header() {
     echo -e "${CLEAR}${B_CYAN}======================================================"
-    echo -e "           🦙 LLAMA COMMAND CENTER (v8.0) 🦙"
+    echo -e "           🦙 LLAMA COMMAND CENTER (v8.1) 🦙"
     echo -e "           * Universal GPU & Repair Mode *"
     echo -e "======================================================${NC}"
 }
@@ -87,9 +89,10 @@ deep_repair() {
     # 2. Hardware-Specific Driver Support
     case $current_gpu in
         "NVIDIA")
-            echo -e "${B_YELLOW}[!] WARNING: This will REMOVE all existing NVIDIA drivers before reinstalling.${NC}"
-            read -p "Proceed with NVIDIA driver reinstall? (yes/no): " nvidia_confirm
-            if [[ "$nvidia_confirm" == "yes" ]]; then
+            echo -e "${B_RED}[!!!] DANGER: The following step will REMOVE all existing NVIDIA drivers.${NC}"
+            echo -e "${B_RED}[!!!] If you are on a Desktop GUI, this may break your display manager!${NC}"
+            read -p "Type 'I UNDERSTAND' to proceed with NVIDIA purge, or anything else to skip: " nvidia_confirm
+            if [[ "$nvidia_confirm" == "I UNDERSTAND" ]]; then
                 echo "Repairing NVIDIA driver fragments..." | tee -a "$LOG_FILE"
                 sudo apt-get remove --purge -y '^nvidia-.*' '^libnvidia-.*' &>> "$LOG_FILE" || true
                 sudo apt-get autoremove -y &>> "$LOG_FILE" || true
@@ -101,13 +104,13 @@ deep_repair() {
             ;;
         "AMD")
             echo "Installing AMD ROCm dependencies..." | tee -a "$LOG_FILE"
-            sudo apt-get update &>> "$LOG_FILE"
-            sudo apt-get install -y libnuma-dev wget gnupg2 &>> "$LOG_FILE"
+            sudo apt-get update &>> "$LOG_FILE" || true
+            sudo apt-get install -y libnuma-dev wget gnupg2 &>> "$LOG_FILE" || true
             sudo apt-get install -y "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" &>> "$LOG_FILE" || true
             ;;
         "INTEL")
             echo "Installing Intel OneAPI/Compute dependencies..." | tee -a "$LOG_FILE"
-            sudo apt-get update &>> "$LOG_FILE"
+            sudo apt-get update &>> "$LOG_FILE" || true
             sudo apt-get install -y intel-opencl-icd intel-level-zero-gpu level-zero &>> "$LOG_FILE" || true
             ;;
         *)
@@ -134,15 +137,15 @@ build_engine() {
     echo -e "${B_CYAN}Building AI Engine for $current_gpu...${NC}"
 
     # Base Dependencies
-    sudo apt-get install -y build-essential git curl cmake libcurl4-openssl-dev libssl-dev &>> "$LOG_FILE"
+    sudo apt-get install -y build-essential git curl cmake libcurl4-openssl-dev libssl-dev &>> "$LOG_FILE" || true
 
     mkdir -p "$HOME/ai_stack"
 
     if [ ! -d "$INSTALL_DIR/.git" ]; then
-        git clone https://github.com/ggerganov/llama.cpp.git "$INSTALL_DIR" | tee -a "$LOG_FILE"
+        git clone https://github.com/ggerganov/llama.cpp.git "$INSTALL_DIR" | tee -a "$LOG_FILE" || { echo "Clone failed."; read -p "Press Enter..."; return 1; }
     else
         echo "Updating existing llama.cpp repo..." | tee -a "$LOG_FILE"
-        (cd "$INSTALL_DIR" && git pull) | tee -a "$LOG_FILE"
+        (cd "$INSTALL_DIR" && git pull) | tee -a "$LOG_FILE" || true
     fi
 
     cd "$INSTALL_DIR" || { echo -e "${B_RED}Cannot cd into $INSTALL_DIR${NC}"; read -p "Press Enter..."; return 1; }
@@ -189,8 +192,8 @@ build_engine() {
     cmake_flags+=("-DGGML_CURL=ON" "-DGGML_SERVER_SSL=ON")
 
     echo "CMake flags: ${cmake_flags[*]}" | tee -a "$LOG_FILE"
-    cmake .. "${cmake_flags[@]}" 2>&1 | tee -a "$LOG_FILE"
-    cmake --build . --config Release -j"$(nproc)" 2>&1 | tee -a "$LOG_FILE"
+    cmake .. "${cmake_flags[@]}" 2>&1 | tee -a "$LOG_FILE" || { echo "CMake config failed."; read -p "Press Enter..."; return 1; }
+    cmake --build . --config Release -j"$(nproc)" 2>&1 | tee -a "$LOG_FILE" || { echo "CMake build failed."; read -p "Press Enter..."; return 1; }
 
     rotate_log
 
@@ -209,8 +212,9 @@ download_menu() {
     echo "1) Llama-3-8B  (Smart mid-size — NousResearch Q4_K_M)"
     echo "2) Mistral-7B  (Industry standard — TheBloke Q4_K_M)"
     echo "3) Phi-3-Mini  (Tiny but powerful — bartowski Q4_K_M)"
-    echo "4) Back"
-    read -p "Select [1-4]: " d
+    echo "4) Custom URL  (Paste direct GGUF download link)"
+    echo "5) Back"
+    read -p "Select [1-5]: " d
 
     local url filename
     case $d in
@@ -220,6 +224,16 @@ download_menu() {
            filename="mistral-7b.gguf" ;;
         3) url="https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q4_K_M.gguf"
            filename="phi3-mini.gguf" ;;
+        4) 
+           read -p "Paste direct GGUF URL: " url
+           read -p "Enter filename to save as (e.g., mymodel.gguf): " filename
+           if [[ -z "$url" || -z "$filename" ]]; then
+               echo -e "${B_RED}Invalid input.${NC}"
+               sleep 1; return
+           fi
+           # Ensure it ends in .gguf
+           [[ "$filename" != *.gguf ]] && filename="${filename}.gguf"
+           ;;
         *) return ;;
     esac
 
@@ -235,7 +249,7 @@ download_menu() {
     if curl -L --fail --progress-bar "$url" -o "$MODEL_DIR/$filename"; then
         echo -e "${B_GREEN}✔ Download complete: $MODEL_DIR/$filename${NC}"
     else
-        echo -e "${B_RED}✖ Download failed. The URL may have changed — check HuggingFace manually.${NC}"
+        echo -e "${B_RED}✖ Download failed. The URL may be invalid or gated.${NC}"
         rm -f "$MODEL_DIR/$filename"
     fi
     read -p "Press Enter to return..."
@@ -255,12 +269,19 @@ prompt_gpu_layers() {
 # --- Model selection helper ---
 select_model() {
     local prompt_text="$1"
-    local models_arr=("$MODEL_DIR"/*.gguf)
-    if [[ ! -e "${models_arr[0]}" ]]; then
+    # Need to handle case where no models exist without throwing unbound variable error
+    local models_found=0
+    for file in "$MODEL_DIR"/*.gguf; do
+        if [[ -f "$file" ]]; then models_found=1; break; fi
+    done
+
+    if [[ $models_found -eq 0 ]]; then
         echo -e "${B_RED}No models found in $MODEL_DIR — download one first.${NC}" >&2
         sleep 2
         return 1
     fi
+    
+    local models_arr=("$MODEL_DIR"/*.gguf)
     PS3="$prompt_text"
     local selected
     select selected in "${models_arr[@]}"; do
@@ -283,7 +304,12 @@ chat_mode() {
     ngl=$(prompt_gpu_layers "$current_gpu")
 
     echo -e "${B_CYAN}Launching chat with $(basename "$model") | GPU layers: $ngl${NC}"
-    "$BUILD_DIR/bin/llama-cli" -m "$model" -ngl "$ngl" -cnv --prio 2
+    echo -e "${B_YELLOW}(Type /exit to quit or Ctrl+C to force exit)${NC}"
+    
+    # Armored execution so a segfault or out-of-memory doesn't kill the whole menu script
+    "$BUILD_DIR/bin/llama-cli" -m "$model" -ngl "$ngl" -cnv --prio 2 || echo -e "\n${B_RED}Chat process exited (or encountered an error).${NC}"
+    
+    read -p "Press Enter to return to menu..."
 }
 
 # --- 🌐 HTTPS WEB SERVER ---
@@ -293,12 +319,12 @@ manage_server() {
     # Handle running server
     if [[ -f "$SERVER_PID_FILE" ]]; then
         local existing_pid
-        existing_pid=$(cat "$SERVER_PID_FILE")
+        existing_pid=$(cat "$SERVER_PID_FILE" 2>/dev/null || echo "")
         if [[ -n "$existing_pid" ]] && ps -p "$existing_pid" > /dev/null 2>&1; then
             echo -e "${B_GREEN}Server is running (PID $existing_pid).${NC}"
             read -p "Stop it? (y/n): " k
             if [[ "$k" == "y" ]]; then
-                kill "$existing_pid"
+                kill "$existing_pid" 2>/dev/null || true
                 rm -f "$SERVER_PID_FILE"
                 echo -e "${B_YELLOW}Server stopped.${NC}"
             fi
@@ -328,7 +354,7 @@ manage_server() {
             -keyout "$key_file_ssl" \
             -out "$cert_file" \
             -sha256 -days 365 -nodes \
-            -subj "/CN=llama.local" &> /dev/null
+            -subj "/CN=llama.local" &> /dev/null || echo "Warning: Failed to generate SSL cert."
     fi
 
     local api_key
@@ -336,6 +362,7 @@ manage_server() {
 
     local ip
     ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [[ -z "$ip" ]] && ip="127.0.0.1"
 
     "$BUILD_DIR/bin/llama-server" \
         -m "$model" \
@@ -352,7 +379,7 @@ manage_server() {
 
     # Persist API key securely
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Server PID=$server_pid | Model=$(basename "$model") | GPU layers=$ngl | Key=$api_key" >> "$KEY_FILE"
-    chmod 600 "$KEY_FILE"
+    chmod 600 "$KEY_FILE" 2>/dev/null || true
 
     echo -e "\n${B_GREEN}🚀 SERVER LIVE: https://$ip:8080${NC}"
     echo -e "${B_YELLOW}   API Key: $api_key${NC}"
@@ -365,9 +392,6 @@ manage_server() {
 rotate_log
 
 while true; do
-    # Disable set -e for the menu loop so a bad sub-command doesn't exit
-    set +e
-
     draw_header
     CUR_GPU=$(detect_gpu)
 
@@ -381,7 +405,7 @@ while true; do
     fi
 
     if [[ -f "$SERVER_PID_FILE" ]]; then
-        SRV_PID=$(cat "$SERVER_PID_FILE")
+        SRV_PID=$(cat "$SERVER_PID_FILE" 2>/dev/null || echo "")
         if [[ -n "$SRV_PID" ]] && ps -p "$SRV_PID" > /dev/null 2>&1; then
             echo -e "  Web Server:    ${B_GREEN}✓ RUNNING (PID $SRV_PID)${NC}"
         else
@@ -392,26 +416,26 @@ while true; do
         echo -e "  Web Server:    ${B_RED}✗ STOPPED${NC}"
     fi
 
-    MODELS_COUNT=$(find "$MODEL_DIR" -name "*.gguf" 2>/dev/null | wc -l)
+    MODELS_COUNT=$(find "$MODEL_DIR" -name "*.gguf" 2>/dev/null | wc -l || echo 0)
     echo -e "  Models:        ${B_CYAN}$MODELS_COUNT downloaded${NC}"
 
     echo -e "------------------------------------------------------"
     echo -e "1) ${B_CYAN}Build AI Engine${NC}  (Auto-Detect: $CUR_GPU)"
-    echo -e "2) ${B_CYAN}Download Models${NC}"
+    echo -e "2) ${B_CYAN}Download Models${NC}  (Includes Custom URL option)"
     echo -e "3) ${B_GREEN}Interactive Chat${NC}"
     echo -e "4) ${B_GREEN}Start / Stop Web Server${NC}"
-    echo -e "5) ${B_RED}DEEP REPAIR${NC}     (Fix Drivers/Conflicts)"
+    echo -e "5) ${B_RED}DEEP REPAIR${NC}      (Fix Drivers/Conflicts)"
     echo -e "6) View Forensic Logs"
     echo -e "7) View Saved API Keys"
     echo -e "8) Exit"
     read -p "Action: " choice
 
     case $choice in
-        1) set -e; build_engine ;;
-        2) set -e; download_menu ;;
-        3) set -e; chat_mode ;;
-        4) set -e; manage_server ;;
-        5) set -e; deep_repair ;;
+        1) build_engine ;;
+        2) download_menu ;;
+        3) chat_mode ;;
+        4) manage_server ;;
+        5) deep_repair ;;
         6)
             draw_header
             echo -e "${B_CYAN}--- Last 50 lines of $LOG_FILE ---${NC}"
