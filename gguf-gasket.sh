@@ -14,7 +14,7 @@ CLEAR='\033[2J\033[H'
 # --- Paths ---
 INSTALL_DIR="$HOME/ai_stack/llama.cpp"
 BUILD_DIR="$INSTALL_DIR/build"
-MODEL_DIR="$INSTALL_DIR/models"
+MODEL_DIR="$HOME/ai_stack/models"
 LOG_FILE="$HOME/llama_forensics.log"
 SERVER_PID_FILE="/tmp/llama_server.pid"
 KEY_FILE="$HOME/llama_api_keys.log"
@@ -392,7 +392,7 @@ manage_server() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Server PID=$server_pid | Model=$(basename "$model") | GPU layers=$ngl | Key=$api_key" >> "$KEY_FILE"
     chmod 600 "$KEY_FILE" 2>/dev/null || true
 
-    echo -e "\n${B_GREEN}🚀 SERVER LIVE: https://$ip:8080${NC}"
+    echo -e "\n${B_GREEN}🚀 SERVER LIVE: https://$ip:$network_port ${NC}"
     echo -e "${B_YELLOW}   API Key: $api_key${NC}"
     echo -e "   Key saved to: $KEY_FILE"
     echo -e "   Logs: $INSTALL_DIR/server.log"
