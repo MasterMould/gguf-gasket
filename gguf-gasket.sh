@@ -69,6 +69,7 @@ detect_gpu() {
         echo "NVIDIA"
     elif echo "$gpu_info" | grep -iqE "(Advanced Micro Devices|ATI).*(VGA|Display|3D|Radeon)"; then
         echo "AMD"
+        sudo apt-get install -y libnuma-dev libvulkan-dev:i386 libvulkan-dev wget vulkan-tools glslang-tools libvulkan gnupg2
     elif echo "$gpu_info" | grep -iqE "Intel.*(Arc|UHD|Iris|Graphics)"; then
         echo "INTEL"
     else
