@@ -19,6 +19,13 @@ LOG_FILE="$HOME/llama_forensics.log"
 SERVER_PID_FILE="/tmp/llama_server.pid"
 KEY_FILE="$HOME/llama_api_keys.log"
 
+# --- Config ---
+# for web server
+#Set network acessability: 0.0.0.0 = Yes - 127.0.0.1 = No 
+visible2network="127.0.0.1"
+# change acess port from default 8080 
+$network_port="8080"
+
 # --- Log rotation (keep last 500 lines) ---
 rotate_log() {
     if [[ -f "$LOG_FILE" ]]; then
@@ -148,10 +155,6 @@ build_engine() {
         (cd "$INSTALL_DIR" && git pull) | tee -a "$LOG_FILE" || true
     fi
 
-# Add user to groups
-    sudo usermod -aG render $USER
-    sudo usermod -aG video $USER
-
     cd "$INSTALL_DIR" || { echo -e "${B_RED}Cannot cd into $INSTALL_DIR${NC}"; read -p "Press Enter..."; return 1; }
 
     if [ -d "build" ]; then
@@ -203,6 +206,10 @@ build_engine() {
 
     if [ -f "bin/llama-server" ]; then
         echo -e "\n${B_GREEN}✔ Success: Built for $current_gpu!${NC}"
+        # Add current user to groups
+        echo -e "${B_YELLOW} Adding $USER to render & video groups... ${NC}"
+        sudo usermod -aG render $USER
+        sudo usermod -aG video $USER
     else
         echo -e "\n${B_RED}✖ Build failed. Check logs with option 6.${NC}"
     fi
@@ -266,7 +273,7 @@ prompt_gpu_layers() {
     if [[ "$current_gpu" != "CPU" ]]; then
         default_ngl=99
     fi
-    read -p "GPU layers to offload (0=CPU only, 99=all) [$default_ngl]: " ngl_input
+    read -p "GPU layers to offload: 0=CPU only, 99=all (Default all if GPU present) [$default_ngl]: " ngl_input
     echo "${ngl_input:-$default_ngl}"
 }
 
@@ -371,8 +378,8 @@ manage_server() {
     "$BUILD_DIR/bin/llama-server" \
         -m "$model" \
         -ngl "$ngl" \
-        --host 0.0.0.0 \
-        --port 8080 \
+        --host "$visible2network" \
+        --port "$network_port" \
         --ssl-key-file "$key_file_ssl" \
         --ssl-cert-file "$cert_file" \
         --api-key "$api_key" \
