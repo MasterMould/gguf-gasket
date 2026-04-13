@@ -58,6 +58,16 @@ check_deps() {
         return 1
     fi
     return 0
+    
+# validare x86_64 platform
+    [[ "$(uname -m)" == "x86_64" ]] || ERR "x86_64 required."
+
+# confirm to proceed
+    echo ""
+    INFO "Available disk: $(df -h "$HOME" | awk 'NR==2{print $4}') free"
+    INFO "System RAM: $(free -h | awk '/Mem:/ {print $2}')"
+    WARN "The 8B model download is ~5 GB. Ensure you have ~8 GB free total."
+    ask "Continue?" || exit 0
 }
 
 # --- 🔍 HARDWARE DETECTION ENGINE ---
@@ -70,8 +80,23 @@ detect_gpu() {
     elif echo "$gpu_info" | grep -iqE "(Advanced Micro Devices|ATI).*(VGA|Display|3D|Radeon)"; then
         echo "AMD"
         sudo apt-get install -y libnuma-dev libvulkan-dev:i386 libvulkan-dev wget vulkan-tools glslang-tools libvulkan gnupg2
+    
     elif echo "$gpu_info" | grep -iqE "Intel.*(Arc|UHD|Iris|Graphics)"; then
         echo "INTEL"
+# Method 1    
+        if clinfo | grep -i "Device Name" | grep -iq "Arc"; then
+    OK " Intel Arc GPU visible via OpenCL"
+    else
+        WARN "  Intel Arc GPU NOT fully visible via OpenCL"
+    fi
+# Method 2    
+    if lspci | grep -qi "Arc A770"; then
+    OK " Intel Arc A770 detected via lspci"
+    else
+        WARN "Could not confirm Arc A770 via lspci. Proceeding anyway — verify your GPU."
+        lspci | grep -i "VGA\|Display\|3D" || true
+    fi
+    
     else
         echo "CPU"
     fi
