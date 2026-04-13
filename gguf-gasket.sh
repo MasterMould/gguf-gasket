@@ -79,10 +79,10 @@ detect_gpu() {
         echo "NVIDIA"
     elif echo "$gpu_info" | grep -iqE "(Advanced Micro Devices|ATI).*(VGA|Display|3D|Radeon)"; then
         echo "AMD"
-        sudo apt-get install -y libnuma-dev libvulkan-dev:i386 libvulkan-dev wget vulkan-tools glslang-tools libvulkan gnupg2
-    
+    install_AMD_gpu_drivers    
     elif echo "$gpu_info" | grep -iqE "Intel.*(Arc|UHD|Iris|Graphics)"; then
         echo "INTEL"
+        install_intel_gpu_drivers
 # Method 1    
         if clinfo | grep -i "Device Name" | grep -iq "Arc"; then
     OK " Intel Arc GPU visible via OpenCL"
@@ -99,6 +99,116 @@ detect_gpu() {
     
     else
         echo "CPU"
+    fi
+}
+
+install_AMD_gpu_drivers() {
+    sudo apt-get install -y libnuma-dev libvulkan-dev:i386 libvulkan-dev wget vulkan-tools glslang-tools libvulkan gnupg2
+}
+
+install_intel_gpu_drivers() {
+    STEP "2/7  Intel Arc A770 GPU drivers"
+
+    # ── Intel compute-runtime (OpenCL ICD + level-zero) ──────────
+    # Two separate driver stacks must both be present:
+    #   OpenCL:    intel-opencl-icd  (used by clinfo, OpenCL apps)
+    #   SYCL/L0:   libze-intel-gpu1  (used by llama.cpp SYCL backend)
+    # These come from different repos and must NOT conflict. We check
+    # each independently and only install what is genuinely missing.
+    INFO "Checking Intel GPU driver packages…"
+
+    # Ensure Intel GPU repo is present (needed for libze-intel-gpu1)
+    if [[ ! -f /etc/apt/sources.list.d/intel-gpu.list ]]; then
+        wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
+            | sudo gpg --yes --dearmor \
+                -o /usr/share/keyrings/intel-graphics.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
+https://repositories.intel.com/gpu/ubuntu noble unified" \
+            | sudo tee /etc/apt/sources.list.d/intel-gpu.list
+        sudo apt-get update -qq || true
+    fi
+
+    local PKGS=()
+
+    # OpenCL ICD — from Ubuntu universe if not present
+    if ! dpkg -l intel-opencl-icd 2>/dev/null | grep -q '^ii'; then
+        PKGS+=("intel-opencl-icd")
+    else
+        INFO "  intel-opencl-icd     ✓ already installed"
+    fi
+
+    # level-zero GPU backend — CRITICAL for SYCL; from Intel GPU repo
+    # libze-intel-gpu1 and intel-level-zero-gpu are alternatives; accept either
+    if dpkg -l libze-intel-gpu1 2>/dev/null | grep -q '^ii' \
+    || dpkg -l intel-level-zero-gpu 2>/dev/null | grep -q '^ii'; then
+        INFO "  level-zero GPU shim  ✓ already installed"
+    else
+        PKGS+=("libze-intel-gpu1")
+    fi
+
+    # level-zero loader (ICD dispatcher) — from Ubuntu main
+    if ! dpkg -l libze1 2>/dev/null | grep -q '^ii'; then
+        PKGS+=("libze1")
+    else
+        INFO "  libze1               ✓ already installed"
+    fi
+
+    if [[ ${#PKGS[@]} -gt 0 ]]; then
+        INFO "  Installing: ${PKGS[*]}"
+        sudo apt-get install -y "${PKGS[@]}" || true
+    fi
+
+    sudo apt-get install -y --no-install-recommends clinfo libze-dev 2>/dev/null || true
+    OK "Intel GPU driver packages ready."
+
+    # ── Intel oneAPI — compiler + runtime ─────────────────────────
+    # intel-oneapi-runtime-dpcpp-cpp  = runtime libs only (no icx/icpx)
+    # intel-oneapi-dpcpp-cpp          = actual SYCL compiler (icx/icpx)
+    # We need the COMPILER to build llama.cpp; runtime alone is not enough.
+    INFO "Checking Intel oneAPI compiler…"
+
+    # Find icx wherever oneAPI may have put it
+    local ICX_BIN=""
+    ICX_BIN=$(command -v icx 2>/dev/null) \
+        || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
+        || true
+
+    if [[ -n "$ICX_BIN" ]]; then
+        OK "Intel icx compiler found: $ICX_BIN"
+    else
+        INFO "Installing Intel oneAPI compiler (intel-oneapi-dpcpp-cpp)…"
+        # Ensure the oneAPI repo is present
+        if [[ ! -f /etc/apt/sources.list.d/oneAPI.list ]]; then
+            wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+                | sudo gpg --yes --dearmor \
+                    -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] \
+https://apt.repos.intel.com/oneapi all main" \
+                | sudo tee /etc/apt/sources.list.d/oneAPI.list
+            sudo apt-get update -qq || true
+        fi
+        # intel-oneapi-compiler-dpcpp-cpp = icx/icpx compilers + setvars.sh
+        # (intel-oneapi-runtime-dpcpp-cpp is runtime only — no compilers)
+        sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp
+        ICX_BIN=$(command -v icx 2>/dev/null) \
+            || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
+            || true
+        [[ -n "$ICX_BIN" ]] && OK "icx installed: $ICX_BIN" \
+            || ERR "icx still not found after install — check apt output above."
+    fi
+
+    # ── Groups + verify ───────────────────────────────────────────
+    sudo usermod -aG render,video "$USER" 2>/dev/null || true
+    OK "User added to render/video groups (re-login to take effect)."
+
+    INFO "GPU visibility check:"
+    echo -e "  OpenCL (clinfo):"; clinfo -l 2>/dev/null | grep -i "intel\|Arc" || WARN "  No Intel GPU via OpenCL"
+    echo -e "  level-zero backend:"
+    if dpkg -l libze-intel-gpu1 2>/dev/null | grep -q '^ii'; then
+        OK "  libze-intel-gpu1 installed — SYCL should see the GPU after re-login"
+    else
+        WARN "  libze-intel-gpu1 NOT installed — SYCL will not find the GPU!"
+        WARN "  Run: sudo apt-get install libze-intel-gpu1"
     fi
 }
 
