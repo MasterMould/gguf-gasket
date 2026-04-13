@@ -105,7 +105,7 @@ deep_repair() {
         "AMD")
             echo "Installing AMD ROCm dependencies..." | tee -a "$LOG_FILE"
             sudo apt-get update &>> "$LOG_FILE" || true
-            sudo apt-get install -y libnuma-dev wget gnupg2 &>> "$LOG_FILE" || true
+            sudo apt-get install -y libnuma-dev wget rocm-dev hipcc gnupg2 &>> "$LOG_FILE" || true
             sudo apt-get install -y "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" &>> "$LOG_FILE" || true
             ;;
         "INTEL")
@@ -147,6 +147,10 @@ build_engine() {
         echo "Updating existing llama.cpp repo..." | tee -a "$LOG_FILE"
         (cd "$INSTALL_DIR" && git pull) | tee -a "$LOG_FILE" || true
     fi
+
+# Add user to groups
+    sudo usermod -aG render $USER
+    sudo usermod -aG video $USER
 
     cd "$INSTALL_DIR" || { echo -e "${B_RED}Cannot cd into $INSTALL_DIR${NC}"; read -p "Press Enter..."; return 1; }
 
