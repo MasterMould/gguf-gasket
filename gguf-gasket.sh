@@ -24,7 +24,7 @@ KEY_FILE="$HOME/llama_api_keys.log"
 #Set network acessability: 0.0.0.0 = Yes - 127.0.0.1 = No 
 visible2network="127.0.0.1"
 # change acess port from default 8080 
-$network_port="8080"
+network_port="8080"
 
 # --- Log rotation (keep last 500 lines) ---
 rotate_log() {
