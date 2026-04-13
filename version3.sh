@@ -105,7 +105,7 @@ deep_repair() {
         "AMD")
             echo "Installing AMD ROCm dependencies..." | tee -a "$LOG_FILE"
             sudo apt-get update &>> "$LOG_FILE" || true
-            sudo apt-get install -y libnuma-dev wget vulkan-tools libvulkan gnupg2 &>> "$LOG_FILE" || true
+            sudo apt-get install -y libnuma-dev wget vulkan-tools vulkan-sdk-headers google-shaderc libvulkan gnupg2 &>> "$LOG_FILE" || true
             sudo apt-get install -y "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" &>> "$LOG_FILE" || true
             ;;
         "INTEL")
