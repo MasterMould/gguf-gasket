@@ -105,7 +105,7 @@ deep_repair() {
         "AMD")
             echo "Installing AMD ROCm dependencies..." | tee -a "$LOG_FILE"
             sudo apt-get update &>> "$LOG_FILE" || true
-            sudo apt-get install -y libnuma-dev wget rocm-dev hipcc gnupg2 &>> "$LOG_FILE" || true
+            sudo apt-get install -y libnuma-dev wget vulkan-tools libvulkan gnupg2 &>> "$LOG_FILE" || true
             sudo apt-get install -y "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" &>> "$LOG_FILE" || true
             ;;
         "INTEL")
@@ -174,8 +174,8 @@ build_engine() {
             cmake_flags+=("-DGGML_CUDA=ON" "-DCMAKE_CUDA_ARCHITECTURES=$arch")
             ;;
         "AMD")
-            echo "Optimizing for AMD (HIP/ROCm)..." | tee -a "$LOG_FILE"
-            cmake_flags+=("-DGGML_HIPBLAS=ON")
+            echo "Optimizing for AMD (Vulkan)..." | tee -a "$LOG_FILE"
+            cmake_flags+=("-DGGML_VULKAN=ON")
             ;;
         "INTEL")
             echo "Optimizing for Intel Arc (SYCL)..." | tee -a "$LOG_FILE"
