@@ -41,7 +41,7 @@ draw_header() {
 # --- ✅ PREFLIGHT DEPENDENCY CHECK ---
 check_deps() {
     local missing=()
-    for cmd in git cmake curl openssl lspci nproc; do
+    for cmd in git cmake curl openssl lspci ccache nproc; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
