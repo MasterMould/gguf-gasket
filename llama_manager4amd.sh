@@ -14,7 +14,7 @@ CLEAR='\033[2J\033[H'
 # --- Paths ---
 INSTALL_DIR="$HOME/ai_stack/llama.cpp"
 BUILD_DIR="$INSTALL_DIR/build"
-MODEL_DIR="$INSTALL_DIR/models"
+MODEL_DIR="$HOME/ai_stack/models"
 LOG_FILE="$HOME/llama_forensics.log"
 SERVER_PID_FILE="/tmp/llama_server.pid"
 KEY_FILE="$HOME/llama_api_keys.log"
@@ -40,15 +40,21 @@ draw_header() {
 
 # --- ✅ PREFLIGHT DEPENDENCY CHECK ---
 check_deps() {
-    local missing=()
-    for cmd in git cmake curl openssl lspci ccache nproc; do
+
+    local missing=()	
+    for cmd in git cmake curl openssl ccache pciutils coreutils libvulkan-dev glslc spirv-headers vulkan-tools; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo -e "${B_RED}[!] Missing required tools: ${missing[*]}${NC}"
-        echo -e "    Install with: sudo apt install ${missing[*]}"
+        echo -e " Installing ${missing[*]} "
+# Delete existing build
+       	cd $INSTALL_DIR
+	rm -rf build
+# Install required 
+	sudo apt-get install -y git cmake curl openssl ccache pciutils coreutils libvulkan-dev glslc spirv-headers vulkan-tools sudo apt install glslang-tools
         echo -e "    (pciutils provides lspci; coreutils provides nproc)"
-        return 1
+        return 0
     fi
     return 0
 }
