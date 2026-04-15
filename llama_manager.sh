@@ -11,7 +11,7 @@ CLEAR='\033[2J\033[H'
 # --- Paths ---
 INSTALL_DIR="$HOME/ai_stack/llama.cpp"
 BUILD_DIR="$INSTALL_DIR/build"
-MODEL_DIR="$INSTALL_DIR/models"
+MODEL_DIR="$HOME/ai_stack/models"
 LOG_FILE="$HOME/llama_forensics.log"
 SERVER_PID_FILE="/tmp/llama_server.pid"
 
