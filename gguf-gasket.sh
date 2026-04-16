@@ -296,8 +296,8 @@ build_engine() {
         sudo apt-get update -qq
     sudo apt-get install -y --no-install-recommends \
     pkg-config ca-certificates unzip file libfuse2 libwebkit2gtk-4.1-dev libgtk-3-dev \
-    gpg-agent software-properties-common ocl-icd-libopencl1 \          # OpenCL ICD loader
-    build-essential git curl cmake libcurl4-openssl-dev libssl-dev &>> "$LOG_FILE" || true
+    gpg-agent software-properties-common ocl-icd-libopencl1 build-essential git curl cmake \ 
+    libdnnl-dev libcurl4-openssl-dev libssl-dev &>> "$LOG_FILE" || true
 
     
     OK "System packages installed."
