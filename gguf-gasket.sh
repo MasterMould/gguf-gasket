@@ -530,7 +530,7 @@ manage_server() {
 
     local ip
     ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    [[ -z "$ip" ]] && ip="127.0.0.1"
+    [[ -z "$ip" ]] && ip="$visible2network"    #127.0.0.1"
 
     "$BUILD_DIR/bin/llama-server" \
         -m "$model" \
