@@ -26,6 +26,19 @@ visible2network="127.0.0.1"
 # change acess port from default 8080 
 network_port="8080"
 
+# ================================================================
+#  Helpers
+# ================================================================
+ask() {
+    local yn="[Y/n]"; [[ "${2:-y}" == "n" ]] && yn="[y/N]"
+    read -rp "$(echo -e "${Y}  ❓  $1 $yn: ${N}")" r
+    r="${r:-${2:-y}}"
+    [[ "${r,,}" == "y" ]]
+}
+PAUSE() {
+     read -rp "$(echo -e "${Y}  Press Enter to continue…${N}")"; 
+}
+
 # --- Log rotation (keep last 500 lines) ---
 rotate_log() {
     if [[ -f "$LOG_FILE" ]]; then
