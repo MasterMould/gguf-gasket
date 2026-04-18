@@ -475,7 +475,7 @@ chat_mode() {
     echo -e "${B_YELLOW}(Type /exit to quit or Ctrl+C to force exit)${NC}"
     
     # Armored execution so a segfault or out-of-memory doesn't kill the whole menu script
-    "$BUILD_DIR/bin/llama-cli" -m "$model" -ngl "$ngl" -cnv --prio 2 || echo -e "\n${B_RED}Chat process exited (or encountered an error).${NC}"
+    "$BUILD_DIR/bin/llama-cli" -ctx-size=16384 -m "$model" -ngl "$ngl" -cnv --prio 2 || echo -e "\n${B_RED}Chat process exited (or encountered an error).${NC}"
     
     read -p "Press Enter to return to menu..."
 }
