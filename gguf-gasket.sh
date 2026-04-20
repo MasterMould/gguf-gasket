@@ -20,6 +20,7 @@ SERVER_PID_FILE="/tmp/llama_server.pid"
 KEY_FILE="$HOME/llama_api_keys.log"
 
 # --- Config ---
+context_size=16384 # 1024 2048 4096 8192
 # for web server
 #Set network acessability: 0.0.0.0 = Yes - 127.0.0.1 = No 
 visible2network="127.0.0.1"
@@ -95,6 +96,7 @@ detect_gpu() {
     install_AMD_gpu_drivers    
     elif echo "$gpu_info" | grep -iqE "Intel.*(Arc|UHD|Iris|Graphics)"; then
         echo "INTEL"
+
         install_intel_gpu_drivers
 # Method 1    
         if clinfo | grep -i "Device Name" | grep -iq "Arc"; then
@@ -113,6 +115,11 @@ detect_gpu() {
     else
         echo "CPU"
     fi
+}
+
+# nvidia drivers:
+install_Nvidia_gpu_drivers() {
+    sudo apt-get install -y ubuntu-drivers-common nvidia-cuda-toolkit 
 }
 
 install_AMD_gpu_drivers() {
@@ -475,7 +482,7 @@ chat_mode() {
     echo -e "${B_YELLOW}(Type /exit to quit or Ctrl+C to force exit)${NC}"
     
     # Armored execution so a segfault or out-of-memory doesn't kill the whole menu script
-    "$BUILD_DIR/bin/llama-cli" -ctx-size=16384 -m "$model" -ngl "$ngl" -cnv --prio 2 || echo -e "\n${B_RED}Chat process exited (or encountered an error).${NC}"
+    "$BUILD_DIR/bin/llama-cli" -c "$context_size" -m "$model" -ngl "$ngl" -cnv --prio 2 || echo -e "\n${B_RED}Chat process exited (or encountered an error).${NC}"
     
     read -p "Press Enter to return to menu..."
 }
