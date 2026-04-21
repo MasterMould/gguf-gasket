@@ -342,7 +342,7 @@ build_engine() {
             ;;
         "AMD")
             echo "Optimizing for AMD (Vulkan)..." | tee -a "$LOG_FILE"
-            cmake_flags+=("-DGGML_VULKAN=ON")
+            cmake_flags+=("-DGGML_VULKAN=ON" "-DGGML_VULKAN_FLASH_ATTN=ON")
             ;;
         "INTEL")
             echo "Optimizing for Intel Arc (SYCL)..." | tee -a "$LOG_FILE"
@@ -360,7 +360,7 @@ build_engine() {
             ;;
     esac
 
-    cmake_flags+=("-DGGML_CURL=ON" "-DGGML_SERVER_SSL=ON")
+    cmake_flags+=("-DGGML_CURL=ON" "-DGGML_SERVER_SSL=ON" )
 
     echo "CMake flags: ${cmake_flags[*]}" | tee -a "$LOG_FILE"
     cmake .. "${cmake_flags[@]}" 2>&1 | tee -a "$LOG_FILE" || { echo "CMake config failed."; read -p "Press Enter..."; return 1; }
