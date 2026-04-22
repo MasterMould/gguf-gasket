@@ -38,23 +38,20 @@ network_port="8080"
 
 # Persist settings to file so they survive subshell scope issues and script restarts.
 save_settings() {
-    mkdir -p "$(dirname "$SETTINGS_FILE")"
-    printf 'context_size=%s\nvisible2network=%s\nnetwork_port=%s\n' \
-        "$context_size" "$visible2network" "$network_port" > "$SETTINGS_FILE"
+    mkdir -p "$(dirname "$SETTINGS_FILE")" || true
+    # Write as plain bash assignments — allows load_settings to use 'source'
+    {
+        echo "context_size=$context_size"
+        echo "visible2network=$visible2network"
+        echo "network_port=$network_port"
+    } > "$SETTINGS_FILE" || WARN "Could not write settings to $SETTINGS_FILE"
 }
 
 load_settings() {
     [[ -f "$SETTINGS_FILE" ]] || return 0
-    local _ctx _net _port
-    _ctx=$(grep  '^context_size='    "$SETTINGS_FILE" | cut -d= -f2)
-    _net=$(grep  '^visible2network=' "$SETTINGS_FILE" | cut -d= -f2)
-    _port=$(grep '^network_port='   "$SETTINGS_FILE" | cut -d= -f2)
-    # Only apply if values look sane — protects against a corrupt file
-    [[ "$_ctx"  =~ ^[0-9]+$ ]]                                  && context_size=$_ctx
-    [[ "$_net"  =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$|^0\.0\.0\.0$ ]] \
-                                                                 && visible2network=$_net
-    [[ "$_port" =~ ^[0-9]+$ ]] && (( _port >= 1 && _port <= 65535 )) \
-                                                                 && network_port=$_port
+    # source executes the file as bash — direct assignment, no parsing, cannot fail silently
+    # shellcheck source=/dev/null
+    source "$SETTINGS_FILE" || true
 }
 
 # Apply any previously saved settings immediately
@@ -696,14 +693,28 @@ chat_mode() {
 
     echo -e "${B_CYAN}Launching chat with $(basename "$model")${NC}"
     echo -e "${B_YELLOW}  Context: $context_size tokens | GPU layers: $ngl${NC}"
-    echo -e "${B_YELLOW}  (Type /exit to quit or Ctrl+C to force exit)${NC}"
+    echo -e "${B_YELLOW}  (Type /bye to quit or Ctrl+C to force exit)${NC}"
+    echo -e "${B_YELLOW}  --no-context-shift: chat will STOP when context window is full${NC}"
 
+    local chat_exit=0
     "$BUILD_DIR/bin/llama-cli" \
         -c "$context_size" \
         -m "$model" \
         -ngl "$ngl" \
         -cnv --prio 2 \
-        || echo -e "\n${B_RED}Chat process exited (or encountered an error).${NC}"
+        --no-context-shift \
+        || chat_exit=$?
+
+    if (( chat_exit != 0 )); then
+        echo -e ""
+        echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+        echo -e "${B_RED}║  Chat ended (exit code $chat_exit)$(printf '%*s' $((31 - ${#chat_exit})) '')║${NC}"
+        echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${B_RED}║${NC}  If the session ran long, the context window  ${B_RED}║${NC}"
+        echo -e "${B_RED}║${NC}  (${B_YELLOW}$context_size tokens${NC}) was likely full.$(printf '%*s' $((14 - ${#context_size})) '')${B_RED}║${NC}"
+        echo -e "${B_RED}║${NC}  Increase it in ${B_YELLOW}Settings → Context Size${NC}.     ${B_RED}║${NC}"
+        echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+    fi
 
     read -p "Press Enter to return to menu..."
 }
