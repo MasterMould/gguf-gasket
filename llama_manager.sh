@@ -31,7 +31,7 @@ KEY_FILE="$HOME/llama_api_keys.log"
 SERVER_INFO_FILE="/tmp/llama_server.info"   # stores active URL + API key for status display
 
 # --- Config (all overridable at runtime via the Settings menu) ---
-context_size=8192         # tokens: 1024 2048 4096 8192 16384 32768
+context_size=16384         # tokens: 1024 2048 4096 8192 16384 32768
 visible2network="127.0.0.1"   # 0.0.0.0 = LAN-accessible  127.0.0.1 = localhost only
 network_port="8080"
 
@@ -69,8 +69,6 @@ draw_header() {
 
 # ================================================================
 #  PREFLIGHT DEPENDENCY CHECK
-# FIX: Unreachable code (platform check, disk info, ask) was placed
-#      AFTER 'return 0' and could never execute. Moved above return.
 # ================================================================
 check_deps() {
     local missing=()
@@ -97,21 +95,6 @@ check_deps() {
     return 0
 }
 
-# ================================================================
-#  HARDWARE DETECTION ENGINE
-#
-#  FIX: install_AMD_gpu_drivers() and install_intel_gpu_drivers()
-#       were called directly inside detect_gpu(). This caused driver
-#       installation to trigger on every single status check and menu
-#       refresh — a serious unintended side-effect. Detection now only
-#       prints the GPU type; installation is left to build_engine()
-#       and deep_repair() where it belongs.
-#
-#  FIX: The Intel elif block contained orphaned if/else statements
-#       (Arc OpenCL and lspci checks) that ran after 'echo "INTEL"'
-#       but produced no useful return value and mixed stdout with the
-#       detect_gpu output, breaking callers.
-# ================================================================
 detect_gpu() {
     local gpu_info
     gpu_info=$(lspci 2>/dev/null || true)
@@ -129,7 +112,6 @@ detect_gpu() {
 
 # ================================================================
 #  GPU DRIVER INSTALLERS
-#  These are now called explicitly from build_engine / deep_repair.
 # ================================================================
 
 install_Nvidia_gpu_drivers() {
@@ -300,13 +282,6 @@ deep_repair() {
 
 # ================================================================
 #  SMART BUILD ENGINE
-#
-#  FIX 1: 'sudo apt-get install -y' with no packages (bare command)
-#          was left on its own line and would error — removed.
-#  FIX 2: Continuation backslash had a trailing space ('cmake \ ')
-#          which breaks line continuation — fixed.
-#  FIX 3: install_AMD/INTEL gpu drivers are now called here during
-#          build so the correct stack is present before compiling.
 # ================================================================
 build_engine() {
     draw_header
@@ -429,7 +404,7 @@ download_menu() {
            filename="phi3-mini.gguf" ;;
         4)
            read -p "Paste direct GGUF URL: " url
-           read -p "Enter filename to save as (e.g., mymodel.gguf): " filename
+           read -p "Enter filename to save as (e.g., https://huggingface.co/ or mymodel.gguf): " filename
            if [[ -z "$url" || -z "$filename" ]]; then
                echo -e "${B_RED}Invalid input.${NC}"
                sleep 1; return
@@ -461,7 +436,7 @@ download_menu() {
 #  SETTINGS — Runtime variable selection menus (NEW)
 # ================================================================
 
-# NEW: Interactive context size picker
+# Interactive context size picker
 select_context_size() {
     echo -e "\n${B_CYAN}Select Context Window Size:${NC}"
     echo "  1)  1024  tokens  (minimal RAM, very short conversations)"
