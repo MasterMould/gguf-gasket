@@ -31,7 +31,7 @@ KEY_FILE="$HOME/llama_api_keys.log"
 
 # --- Config (all overridable at runtime via the Settings menu) ---
 context_size=16384         # tokens: 1024 2048 4096 8192 16384 32768
-visible2network="127.0.0.1"   # 0.0.0.0 = LAN-accessible  127.0.0.1 = localhost only
+visible2network="0.0.0.0"   # 0.0.0.0 = LAN-accessible  127.0.0.1 = localhost only
 network_port="8080"
 
 # ================================================================
@@ -98,18 +98,6 @@ check_deps() {
 
 # ================================================================
 #  HARDWARE DETECTION ENGINE
-#
-#  FIX: install_AMD_gpu_drivers() and install_intel_gpu_drivers()
-#       were called directly inside detect_gpu(). This caused driver
-#       installation to trigger on every single status check and menu
-#       refresh — a serious unintended side-effect. Detection now only
-#       prints the GPU type; installation is left to build_engine()
-#       and deep_repair() where it belongs.
-#
-#  FIX: The Intel elif block contained orphaned if/else statements
-#       (Arc OpenCL and lspci checks) that ran after 'echo "INTEL"'
-#       but produced no useful return value and mixed stdout with the
-#       detect_gpu output, breaking callers.
 # ================================================================
 detect_gpu() {
     local gpu_info
@@ -299,13 +287,6 @@ deep_repair() {
 
 # ================================================================
 #  SMART BUILD ENGINE
-#
-#  FIX 1: 'sudo apt-get install -y' with no packages (bare command)
-#          was left on its own line and would error — removed.
-#  FIX 2: Continuation backslash had a trailing space ('cmake \ ')
-#          which breaks line continuation — fixed.
-#  FIX 3: install_AMD/INTEL gpu drivers are now called here during
-#          build so the correct stack is present before compiling.
 # ================================================================
 build_engine() {
     draw_header
@@ -428,7 +409,7 @@ download_menu() {
            filename="phi3-mini.gguf" ;;
         4)
            read -p "Paste direct GGUF URL: " url
-           read -p "Enter filename to save as (e.g., mymodel.gguf): " filename
+           read -p "Enter filename to save as (e.g., https://huggingface.co/ or mymodel.gguf): " filename
            if [[ -z "$url" || -z "$filename" ]]; then
                echo -e "${B_RED}Invalid input.${NC}"
                sleep 1; return
@@ -716,7 +697,7 @@ manage_server() {
     "$BUILD_DIR/bin/llama-server" \
         -m "$model" \
         -ngl "$ngl" \
-        -c "$context_size" \
+        --ctx-size "$context_size" \
         --host "$visible2network" \
         --port "$network_port" \
         --ssl-key-file "$key_file_ssl" \
