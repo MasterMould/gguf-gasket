@@ -29,11 +29,36 @@ LOG_FILE="$HOME/llama_forensics.log"
 SERVER_PID_FILE="/tmp/llama_server.pid"
 KEY_FILE="$HOME/llama_api_keys.log"
 SERVER_INFO_FILE="/tmp/llama_server.info"   # stores active URL + API key for status display
+SETTINGS_FILE="$HOME/ai_stack/settings.env" # persists runtime settings across sessions
 
 # --- Config (all overridable at runtime via the Settings menu) ---
-context_size=16384         # tokens: 1024 2048 4096 8192 16384 32768
+context_size=8192         # tokens: 1024 2048 4096 8192 16384 32768
 visible2network="127.0.0.1"   # 0.0.0.0 = LAN-accessible  127.0.0.1 = localhost only
 network_port="8080"
+
+# Persist settings to file so they survive subshell scope issues and script restarts.
+save_settings() {
+    mkdir -p "$(dirname "$SETTINGS_FILE")"
+    printf 'context_size=%s\nvisible2network=%s\nnetwork_port=%s\n' \
+        "$context_size" "$visible2network" "$network_port" > "$SETTINGS_FILE"
+}
+
+load_settings() {
+    [[ -f "$SETTINGS_FILE" ]] || return 0
+    local _ctx _net _port
+    _ctx=$(grep  '^context_size='    "$SETTINGS_FILE" | cut -d= -f2)
+    _net=$(grep  '^visible2network=' "$SETTINGS_FILE" | cut -d= -f2)
+    _port=$(grep '^network_port='   "$SETTINGS_FILE" | cut -d= -f2)
+    # Only apply if values look sane — protects against a corrupt file
+    [[ "$_ctx"  =~ ^[0-9]+$ ]]                                  && context_size=$_ctx
+    [[ "$_net"  =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$|^0\.0\.0\.0$ ]] \
+                                                                 && visible2network=$_net
+    [[ "$_port" =~ ^[0-9]+$ ]] && (( _port >= 1 && _port <= 65535 )) \
+                                                                 && network_port=$_port
+}
+
+# Apply any previously saved settings immediately
+load_settings
 
 # ================================================================
 #  Helpers
@@ -69,6 +94,8 @@ draw_header() {
 
 # ================================================================
 #  PREFLIGHT DEPENDENCY CHECK
+# FIX: Unreachable code (platform check, disk info, ask) was placed
+#      AFTER 'return 0' and could never execute. Moved above return.
 # ================================================================
 check_deps() {
     local missing=()
@@ -95,6 +122,21 @@ check_deps() {
     return 0
 }
 
+# ================================================================
+#  HARDWARE DETECTION ENGINE
+#
+#  FIX: install_AMD_gpu_drivers() and install_intel_gpu_drivers()
+#       were called directly inside detect_gpu(). This caused driver
+#       installation to trigger on every single status check and menu
+#       refresh — a serious unintended side-effect. Detection now only
+#       prints the GPU type; installation is left to build_engine()
+#       and deep_repair() where it belongs.
+#
+#  FIX: The Intel elif block contained orphaned if/else statements
+#       (Arc OpenCL and lspci checks) that ran after 'echo "INTEL"'
+#       but produced no useful return value and mixed stdout with the
+#       detect_gpu output, breaking callers.
+# ================================================================
 detect_gpu() {
     local gpu_info
     gpu_info=$(lspci 2>/dev/null || true)
@@ -112,6 +154,7 @@ detect_gpu() {
 
 # ================================================================
 #  GPU DRIVER INSTALLERS
+#  These are now called explicitly from build_engine / deep_repair.
 # ================================================================
 
 install_Nvidia_gpu_drivers() {
@@ -282,6 +325,13 @@ deep_repair() {
 
 # ================================================================
 #  SMART BUILD ENGINE
+#
+#  FIX 1: 'sudo apt-get install -y' with no packages (bare command)
+#          was left on its own line and would error — removed.
+#  FIX 2: Continuation backslash had a trailing space ('cmake \ ')
+#          which breaks line continuation — fixed.
+#  FIX 3: install_AMD/INTEL gpu drivers are now called here during
+#          build so the correct stack is present before compiling.
 # ================================================================
 build_engine() {
     draw_header
@@ -404,7 +454,7 @@ download_menu() {
            filename="phi3-mini.gguf" ;;
         4)
            read -p "Paste direct GGUF URL: " url
-           read -p "Enter filename to save as (e.g., https://huggingface.co/ or mymodel.gguf): " filename
+           read -p "Enter filename to save as (e.g., mymodel.gguf): " filename
            if [[ -z "$url" || -z "$filename" ]]; then
                echo -e "${B_RED}Invalid input.${NC}"
                sleep 1; return
@@ -436,7 +486,7 @@ download_menu() {
 #  SETTINGS — Runtime variable selection menus (NEW)
 # ================================================================
 
-# Interactive context size picker
+# NEW: Interactive context size picker
 select_context_size() {
     echo -e "\n${B_CYAN}Select Context Window Size:${NC}"
     echo "  1)  1024  tokens  (minimal RAM, very short conversations)"
@@ -446,24 +496,29 @@ select_context_size() {
     echo "  5) 16384  tokens"
     echo "  6) 32768  tokens  (large RAM / VRAM required)"
     echo "  7) Custom"
-    read -p "Select [1-7]: " c
+    # -r prevents backslash mangling; reading to a fresh variable avoids
+    # any stale input left in the terminal buffer by prior select loops.
+    local c=""
+    read -r -p "Select [1-7]: " c
     case $c in
-        1) context_size=1024 ;;
-        2) context_size=2048 ;;
-        3) context_size=4096 ;;
-        4) context_size=8192 ;;
-        5) context_size=16384 ;;
-        6) context_size=32768 ;;
+        1) declare -g context_size=1024 ;;
+        2) declare -g context_size=2048 ;;
+        3) declare -g context_size=4096 ;;
+        4) declare -g context_size=8192 ;;
+        5) declare -g context_size=16384 ;;
+        6) declare -g context_size=32768 ;;
         7)
-           read -p "Enter custom context size (min 512): " custom_ctx
+           local custom_ctx=""
+           read -r -p "Enter custom context size (min 512): " custom_ctx
            if [[ "$custom_ctx" =~ ^[0-9]+$ ]] && (( custom_ctx >= 512 )); then
-               context_size=$custom_ctx
+               declare -g context_size=$custom_ctx
            else
                WARN "Invalid value — must be a number ≥ 512. Unchanged."; sleep 1; return
            fi
            ;;
         *) WARN "Invalid selection. Unchanged."; sleep 1; return ;;
     esac
+    save_settings
     OK "Context size set to $context_size tokens."
     sleep 1
 }
@@ -474,23 +529,26 @@ select_network_binding() {
     echo "  1) 127.0.0.1  — Localhost only  (secure default)"
     echo "  2) 0.0.0.0    — All interfaces  (LAN / network accessible)"
     echo "  3) Custom IP"
-    read -p "Select [1-3]: " n
+    local n=""
+    read -r -p "Select [1-3]: " n
     case $n in
-        1) visible2network="127.0.0.1" ;;
+        1) declare -g visible2network="127.0.0.1" ;;
         2)
            WARN "Server will be reachable on the network. Ensure your firewall is configured."
-           visible2network="0.0.0.0"
+           declare -g visible2network="0.0.0.0"
            ;;
         3)
-           read -p "Enter bind address (e.g. 192.168.1.50): " custom_ip
+           local custom_ip=""
+           read -r -p "Enter bind address (e.g. 192.168.1.50): " custom_ip
            if [[ "$custom_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-               visible2network="$custom_ip"
+               declare -g visible2network="$custom_ip"
            else
                WARN "Invalid IP format. Unchanged."; sleep 1; return
            fi
            ;;
         *) WARN "Invalid selection. Unchanged."; sleep 1; return ;;
     esac
+    save_settings
     OK "Network binding set to $visible2network."
     sleep 1
 }
@@ -502,21 +560,24 @@ select_server_port() {
     echo "  2) 8443  (HTTPS convention)"
     echo "  3) 9000"
     echo "  4) Custom"
-    read -p "Select [1-4]: " p
+    local p=""
+    read -r -p "Select [1-4]: " p
     case $p in
-        1) network_port="8080" ;;
-        2) network_port="8443" ;;
-        3) network_port="9000" ;;
+        1) declare -g network_port="8080" ;;
+        2) declare -g network_port="8443" ;;
+        3) declare -g network_port="9000" ;;
         4)
-           read -p "Enter custom port (1024–65535): " custom_port
+           local custom_port=""
+           read -r -p "Enter custom port (1024–65535): " custom_port
            if [[ "$custom_port" =~ ^[0-9]+$ ]] && (( custom_port >= 1024 && custom_port <= 65535 )); then
-               network_port="$custom_port"
+               declare -g network_port="$custom_port"
            else
                WARN "Invalid port. Must be 1024–65535. Unchanged."; sleep 1; return
            fi
            ;;
         *) WARN "Invalid selection. Unchanged."; sleep 1; return ;;
     esac
+    save_settings
     OK "Server port set to $network_port."
     sleep 1
 }
@@ -536,7 +597,8 @@ settings_menu() {
         echo -e "  2) Change Network Binding"
         echo -e "  3) Change Server Port"
         echo -e "  4) Back"
-        read -p "Select [1-4]: " s
+        local s=""
+        read -r -p "Select [1-4]: " s
         case $s in
             1) select_context_size ;;
             2) select_network_binding ;;
@@ -561,7 +623,8 @@ prompt_gpu_layers() {
     echo -e "  3) 32  — Moderate offload (e.g. 8 GB VRAM)" >&2
     echo -e "  4) 99  — Full offload  (recommended for GPU)" >&2
     echo -e "  5) Custom" >&2
-    read -p "Select [1-5] (default: $default_ngl layers): " ngl_choice
+    local ngl_choice=""
+    read -r -p "Select [1-5] (default: $default_ngl layers): " ngl_choice
 
     case $ngl_choice in
         1) echo "0" ;;
@@ -569,7 +632,8 @@ prompt_gpu_layers() {
         3) echo "32" ;;
         4) echo "99" ;;
         5)
-           read -p "Enter number of layers: " custom_ngl >&2 || true
+           local custom_ngl=""
+           read -r -p "Enter number of layers: " custom_ngl
            if [[ "$custom_ngl" =~ ^[0-9]+$ ]]; then
                echo "$custom_ngl"
            else
@@ -620,6 +684,7 @@ select_model() {
 # ================================================================
 chat_mode() {
     draw_header
+    load_settings   # reload from file — guards against any subshell scope leakage
     local current_gpu
     current_gpu=$(detect_gpu)
 
@@ -648,6 +713,7 @@ chat_mode() {
 # ================================================================
 manage_server() {
     draw_header
+    load_settings   # reload from file — guards against any subshell scope leakage
 
     if [[ -f "$SERVER_PID_FILE" ]]; then
         local existing_pid
