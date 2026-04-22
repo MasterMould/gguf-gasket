@@ -30,7 +30,7 @@ SERVER_PID_FILE="/tmp/llama_server.pid"
 KEY_FILE="$HOME/llama_api_keys.log"
 
 # --- Config (all overridable at runtime via the Settings menu) ---
-context_size=8192         # tokens: 1024 2048 4096 8192 16384 32768
+context_size=16384         # tokens: 1024 2048 4096 8192 16384 32768
 visible2network="127.0.0.1"   # 0.0.0.0 = LAN-accessible  127.0.0.1 = localhost only
 network_port="8080"
 
