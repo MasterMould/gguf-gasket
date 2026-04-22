@@ -1,298 +1,1049 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# Dropped global 'set -e' to prevent interactive menu crashes on minor errors.
+# Kept 'set -uo pipefail' for safe variable and pipe handling.
 set -uo pipefail
 
-# ================================================================
-#  STYLING
-# ================================================================
+# --- Styling ---
+
+# --- Safety Helpers (AUTO-PATCHED) ---
+run_or_warn() {
+    "$@" || { echo -e "\033[1;33m  ⚠ Command failed: $*\033[0m"; return 1; }
+}
+
+APT_UPDATED=0
+ensure_apt_updated() {
+    if [[ $APT_UPDATED -eq 0 ]]; then
+        ensure_apt_updated || true
+        APT_UPDATED=1
+    fi
+}
+
 B_RED='\033[1;31m'
 B_GREEN='\033[1;32m'
 B_YELLOW='\033[1;33m'
 B_CYAN='\033[1;36m'
 NC='\033[0m'
 CLEAR='\033[2J\033[H'
-
+# FIX: Y/N were referenced in ask() and PAUSE() but never defined.
 Y="$B_YELLOW"
 N="$NC"
 
+# --- FIX: OK/ERR/INFO/WARN/STEP were called throughout but never defined. ---
 OK()   { echo -e "${B_GREEN}  ✔  $*${NC}"; }
 ERR()  { echo -e "${B_RED}  ✖  $*${NC}" >&2; }
 INFO() { echo -e "      $*"; }
 WARN() { echo -e "${B_YELLOW}  ⚠  $*${NC}"; }
 STEP() { echo -e "${B_CYAN}  ──  $*${NC}"; }
 
-# ================================================================
-#  PATHS / FILES
-# ================================================================
+# --- Paths ---
 INSTALL_DIR="$HOME/ai_stack/llama.cpp"
 BUILD_DIR="$INSTALL_DIR/build"
 MODEL_DIR="$HOME/ai_stack/models"
 LOG_FILE="$HOME/llama_forensics.log"
-
 SERVER_PID_FILE="/tmp/llama_server.pid"
-SERVER_INFO_FILE="/tmp/llama_server.info"
 KEY_FILE="$HOME/llama_api_keys.log"
-
-SETTINGS_FILE="$HOME/ai_stack/settings.env"
 LAST_MODEL_FILE="$HOME/.llama_last_model"
+SERVER_INFO_FILE="/tmp/llama_server.info"   # stores active URL + API key for status display
+SETTINGS_FILE="$HOME/ai_stack/settings.env" # persists runtime settings across sessions
 
-# ================================================================
-#  CONFIG DEFAULTS
-# ================================================================
-context_size=8192
-visible2network="127.0.0.1"
+# --- Config (all overridable at runtime via the Settings menu) ---
+context_size=8192         # tokens: 1024 2048 4096 8192 16384 32768
+visible2network="127.0.0.1"   # 0.0.0.0 = LAN-accessible  127.0.0.1 = localhost only
 network_port="8080"
 EPHEMERAL_KEYS=0
 
-# ================================================================
-#  CORE UTILITIES
-# ================================================================
-run_or_fail() {
-    "$@" || { ERR "Command failed: $*"; return 1; }
+# Persist settings to file so they survive subshell scope issues and script restarts.
+save_settings() {
+    mkdir -p "$(dirname "$SETTINGS_FILE")" || true
+    # Write as plain bash assignments — allows load_settings to use 'source'
+    {
+        echo "context_size=$context_size"
+        echo "visible2network=$visible2network"
+        echo "network_port=$network_port"
+EPHEMERAL_KEYS=0
+    } > "$SETTINGS_FILE" || WARN "Could not write settings to $SETTINGS_FILE"
 }
 
-APT_UPDATED=0
-ensure_apt_updated() {
-    if [[ $APT_UPDATED -eq 0 ]]; then
-        sudo apt-get update -qq || true
-        APT_UPDATED=1
-    fi
+load_settings() {
+    [[ -f "$SETTINGS_FILE" ]] || return 0
+    # source executes the file as bash — direct assignment, no parsing, cannot fail silently
+    # shellcheck source=/dev/null
+    source "$SETTINGS_FILE" || true
 }
 
+# Apply any previously saved settings immediately
+load_settings
+
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+#  Helpers
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+ask() {
+    local yn="[Y/n]"; [[ "${2:-y}" == "n" ]] && yn="[y/N]"
+    read -rp "$(echo -e "${Y}  ❓  $1 $yn: ${N}")" r
+    r="${r:-${2:-y}}"
+    [[ "${r,,}" == "y" ]]
+}
+PAUSE() {
+    read -rp "$(echo -e "${Y}  Press Enter to continue…${N}")"
+}
+
+# --- Log rotation (keep last 500 lines) ---
 rotate_log() {
-    [[ -f "$LOG_FILE" ]] || return
-    local lines
-    lines=$(wc -l < "$LOG_FILE" || echo 0)
-    (( lines > 500 )) && tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    if [[ -f "$LOG_FILE" ]]; then
+        local lines
+        lines=$(wc -l < "$LOG_FILE" || echo 0)
+        if (( lines > 500 )); then
+            tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+        fi
+    fi
     chmod 600 "$LOG_FILE" 2>/dev/null || true
 }
 
 draw_header() {
-    echo -e "${CLEAR}${B_CYAN}============================================="
-    echo -e "        🦙 LLAMA COMMAND CENTER 🦙"
-    echo -e "=============================================${NC}"
+    echo -e "${CLEAR}${B_CYAN}======================================================"
+    echo -e "           🦙 LLAMA COMMAND CENTER (v8.2) 🦙"
+    echo -e "           * Universal GPU & Repair Mode *"
+    echo -e "======================================================${NC}"
+}
+
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
 }
 
 # ================================================================
-#  SETTINGS
-# ================================================================
-save_settings() {
-    mkdir -p "$(dirname "$SETTINGS_FILE")"
-    cat > "$SETTINGS_FILE" <<EOF
-context_size=$context_size
-visible2network=$visible2network
-network_port=$network_port
-EPHEMERAL_KEYS=$EPHEMERAL_KEYS
-EOF
+#  PREFLIGHT DEPENDENCY CHECK
+# FIX: Unreachable code (platform check, disk info, ask) was placed
+#      AFTER 'return 0' and could never execute. Moved above return.
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
 }
 
-load_settings() {
-    [[ -f "$SETTINGS_FILE" ]] && source "$SETTINGS_FILE"
+# ================================================================
+check_deps() {
+    local missing=()
+    for cmd in git cmake curl openssl lspci ccache nproc; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "${B_RED}[!] Missing required tools: ${missing[*]}${NC}"
+        echo -e "    Install with: sudo apt install ${missing[*]}"
+        echo -e "    (pciutils provides lspci; coreutils provides nproc)"
+        return 1
+    fi
+
+    # Validate x86_64 platform (was unreachable before)
+    if [[ "$(uname -m)" != "x86_64" ]]; then
+        ERR "x86_64 architecture required. Detected: $(uname -m)"
+        return 1
+    fi
+
+    echo ""
+    INFO "Available disk: $(df -h "$HOME" | awk 'NR==2{print $4}') free"
+    INFO "System RAM:     $(free -h | awk '/Mem:/ {print $2}')"
+    WARN "The 8B model download is ~5 GB. Ensure you have ~8 GB free total."
+    return 0
 }
 
-load_settings
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
 
 # ================================================================
-#  GPU DETECTION (IMPROVED)
-# ================================================================
+#  HARDWARE DETECTION ENGINE
+#
+#  FIX: install_AMD_gpu_drivers() and install_intel_gpu_drivers()
 detect_gpu() {
-    local gpu
-    gpu=$(lspci -nn | grep -Ei 'vga|3d|display' || true)
+    local gpu_info
+    gpu_info=$(lspci -nn 2>/dev/null | grep -Ei "vga|3d|display" || true)
 
-    if echo "$gpu" | grep -iq nvidia; then
+    if echo "$gpu_info" | grep -iq nvidia; then
         echo "NVIDIA"
-    elif echo "$gpu" | grep -iq amd; then
+    elif echo "$gpu_info" | grep -iq amd; then
         echo "AMD"
-    elif echo "$gpu" | grep -iq intel; then
+    elif echo "$gpu_info" | grep -iq intel; then
         echo "INTEL"
     else
         echo "CPU"
     fi
 }
 
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
 # ================================================================
-#  MODEL SELECTION (FIXED GLOBBING + MEMORY)
+#  GPU DRIVER INSTALLERS
+#  These are now called explicitly from build_engine / deep_repair.
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+
+install_Nvidia_gpu_drivers() {
+    STEP "Installing NVIDIA CUDA toolkit…"
+    sudo apt-get install -y ubuntu-drivers-common nvidia-cuda-toolkit &>> "$LOG_FILE" || true
+}
+
+install_AMD_gpu_drivers() {
+    STEP "Installing AMD / Vulkan dependencies…"
+    sudo apt-get install -y \
+        libnuma-dev libvulkan-dev wget vulkan-tools \
+        glslang-tools gnupg2 &>> "$LOG_FILE" || true
+    # Note: libvulkan-dev:i386 requires multiarch; install separately if needed.
+    sudo dpkg --add-architecture i386 2>/dev/null || true
+    ensure_apt_updated &>> "$LOG_FILE" || true
+    sudo apt-get install -y libvulkan-dev:i386 &>> "$LOG_FILE" || true
+}
+
+install_intel_gpu_drivers() {
+    STEP "Installing Intel Arc GPU drivers (OpenCL + level-zero + oneAPI)…"
+
+    # ── Intel compute-runtime (OpenCL ICD + level-zero) ──────────
+    INFO "Checking Intel GPU driver packages…"
+
+    if [[ ! -f /etc/apt/sources.list.d/intel-gpu.list ]]; then
+        wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
+            | sudo gpg --yes --dearmor \
+                -o /usr/share/keyrings/intel-graphics.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
+https://repositories.intel.com/gpu/ubuntu noble unified" \
+            | sudo tee /etc/apt/sources.list.d/intel-gpu.list
+        ensure_apt_updated || true
+    fi
+
+    local PKGS=()
+
+    if ! dpkg -l intel-opencl-icd 2>/dev/null | grep -q '^ii'; then
+        PKGS+=("intel-opencl-icd")
+    else
+        INFO "  intel-opencl-icd     ✓ already installed"
+    fi
+
+    if dpkg -l libze-intel-gpu1 2>/dev/null | grep -q '^ii' \
+    || dpkg -l intel-level-zero-gpu 2>/dev/null | grep -q '^ii'; then
+        INFO "  level-zero GPU shim  ✓ already installed"
+    else
+        PKGS+=("libze-intel-gpu1")
+    fi
+
+    if ! dpkg -l libze1 2>/dev/null | grep -q '^ii'; then
+        PKGS+=("libze1")
+    else
+        INFO "  libze1               ✓ already installed"
+    fi
+
+    if [[ ${#PKGS[@]} -gt 0 ]]; then
+        INFO "  Installing: ${PKGS[*]}"
+        sudo apt-get install -y "${PKGS[@]}" &>> "$LOG_FILE" || true
+    fi
+
+    sudo apt-get install -y --no-install-recommends clinfo libze-dev &>> "$LOG_FILE" 2>/dev/null || true
+    OK "Intel GPU driver packages ready."
+
+    # ── Intel oneAPI — compiler + runtime ─────────────────────────
+    INFO "Checking Intel oneAPI compiler…"
+    local ICX_BIN=""
+    ICX_BIN=$(command -v icx 2>/dev/null) \
+        || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
+        || true
+
+    if [[ -n "$ICX_BIN" ]]; then
+        OK "Intel icx compiler found: $ICX_BIN"
+    else
+        INFO "Installing Intel oneAPI compiler (intel-oneapi-compiler-dpcpp-cpp)…"
+        if [[ ! -f /etc/apt/sources.list.d/oneAPI.list ]]; then
+            wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+                | sudo gpg --yes --dearmor \
+                    -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] \
+https://apt.repos.intel.com/oneapi all main" \
+                | sudo tee /etc/apt/sources.list.d/oneAPI.list
+            ensure_apt_updated || true
+        fi
+        sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp &>> "$LOG_FILE"
+        ICX_BIN=$(command -v icx 2>/dev/null) \
+            || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
+            || true
+        [[ -n "$ICX_BIN" ]] \
+            && OK "icx installed: $ICX_BIN" \
+            || ERR "icx still not found after install — check apt output above."
+    fi
+
+    # ── Groups + verify ───────────────────────────────────────────
+    sudo usermod -aG render,video "$USER" 2>/dev/null || true
+    OK "User added to render/video groups (re-login to take effect)."
+
+    INFO "GPU visibility check:"
+    echo -e "  OpenCL (clinfo):"; clinfo -l 2>/dev/null | grep -i "intel\|Arc" || WARN "  No Intel GPU via OpenCL"
+    echo -e "  level-zero backend:"
+    if dpkg -l libze-intel-gpu1 2>/dev/null | grep -q '^ii'; then
+        OK "  libze-intel-gpu1 installed — SYCL should see the GPU after re-login"
+    else
+        WARN "  libze-intel-gpu1 NOT installed — SYCL will not find the GPU!"
+        WARN "  Run: sudo apt-get install libze-intel-gpu1"
+    fi
+}
+
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+#  UNIVERSAL REPAIR & DEPENDENCY MODULE
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+deep_repair() {
+    draw_header
+    local current_gpu
+    current_gpu=$(detect_gpu)
+    echo -e "${B_RED}[!!!] STARTING UNIVERSAL REPAIR [!!!]${NC}"
+    echo -e "${B_YELLOW}[!] WARNING: This will modify system drivers. Ensure you have a way to recover.${NC}"
+    read -r -p "Are you sure you want to continue? (yes/no): " confirm
+    [[ "$confirm" != "yes" ]] && { echo "Repair cancelled."; sleep 1; return; }
+
+    echo "Detected Hardware: $current_gpu" | tee -a "$LOG_FILE"
+
+    # 1. Fix APT/DPKG issues safely
+    echo -e "\n1. Fixing APT/DPKG state..." | tee -a "$LOG_FILE"
+    sudo dpkg --configure -a &>> "$LOG_FILE" || true
+    sudo apt-get --fix-broken install -y &>> "$LOG_FILE" || true
+
+    # 2. Hardware-Specific Driver Support
+    case $current_gpu in
+        "NVIDIA")
+            echo -e "${B_RED}[!!!] DANGER: The following step will REMOVE all existing NVIDIA drivers.${NC}"
+            echo -e "${B_RED}[!!!] If you are on a Desktop GUI, this may break your display manager!${NC}"
+            read -r -p "Type 'I UNDERSTAND' to proceed with NVIDIA purge, or anything else to skip: " nvidia_confirm
+            if [[ "$nvidia_confirm" == "I UNDERSTAND" ]]; then
+                echo "Repairing NVIDIA driver fragments..." | tee -a "$LOG_FILE"
+                sudo apt-get remove --purge -y '^nvidia-.*' '^libnvidia-.*' &>> "$LOG_FILE" || true
+                sudo apt-get autoremove -y &>> "$LOG_FILE" || true
+                ensure_apt_updated &>> "$LOG_FILE"
+                # FIX: install_Nvidia_gpu_drivers() was defined but never called in repair.
+                install_Nvidia_gpu_drivers
+                sudo ubuntu-drivers autoinstall &>> "$LOG_FILE" || true
+            else
+                echo "Skipping NVIDIA driver reinstall." | tee -a "$LOG_FILE"
+            fi
+            ;;
+        "AMD")
+            echo "Installing AMD ROCm dependencies..." | tee -a "$LOG_FILE"
+            ensure_apt_updated &>> "$LOG_FILE" || true
+            install_AMD_gpu_drivers
+            sudo apt-get install -y \
+                "linux-headers-$(uname -r)" \
+                "linux-modules-extra-$(uname -r)" &>> "$LOG_FILE" || true
+            ;;
+        "INTEL")
+            echo "Installing Intel OneAPI/Compute dependencies..." | tee -a "$LOG_FILE"
+            ensure_apt_updated &>> "$LOG_FILE" || true
+            install_intel_gpu_drivers
+            ;;
+        *)
+            echo "CPU-only mode — no GPU drivers to repair." | tee -a "$LOG_FILE"
+            ;;
+    esac
+
+    rotate_log
+    echo -e "\n${B_GREEN}Repair sequence finished. REBOOT strongly recommended.${NC}"
+    read -r -p "Reboot now? (y/n): " rb
+    [[ "$rb" == "y" ]] && sudo reboot
+}
+
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+#  SMART BUILD ENGINE
+#
+#  FIX 1: 'sudo apt-get install -y' with no packages (bare command)
+#          was left on its own line and would error — removed.
+#  FIX 2: Continuation backslash had a trailing space ('cmake \ ')
+#          which breaks line continuation — fixed.
+#  FIX 3: install_AMD/INTEL gpu drivers are now called here during
+#          build so the correct stack is present before compiling.
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+build_engine() {
+    draw_header
+    if ! check_deps; then
+        read -r -p "Press Enter to return..."
+        return
+    fi
+
+    local current_gpu
+    current_gpu=$(detect_gpu)
+    echo -e "${B_CYAN}Building AI Engine for $current_gpu...${NC}"
+
+    # Base Dependencies
+    ensure_apt_updated
+    sudo apt-get install -y --no-install-recommends \
+        pkg-config ca-certificates unzip file libfuse2 \
+        libwebkit2gtk-4.1-dev libgtk-3-dev gpg-agent \
+        software-properties-common ocl-icd-libopencl1 \
+        build-essential git curl cmake \
+        libdnnl-dev libcurl4-openssl-dev libssl-dev &>> "$LOG_FILE" || true
+
+    OK "System packages installed."
+
+    mkdir -p "$HOME/ai_stack"
+
+    if [ ! -d "$INSTALL_DIR/.git" ]; then
+        git clone https://github.com/ggerganov/llama.cpp.git "$INSTALL_DIR" \
+            | tee -a "$LOG_FILE" \
+            || { echo "Clone failed."; read -r -p "Press Enter..."; return 1; }
+    else
+        echo "Updating existing llama.cpp repo..." | tee -a "$LOG_FILE"
+        (cd "$INSTALL_DIR" && git pull) | tee -a "$LOG_FILE" || true
+    fi
+
+    cd "$INSTALL_DIR" || { echo -e "${B_RED}Cannot cd into $INSTALL_DIR${NC}"; read -r -p "Press Enter..."; return 1; }
+
+    if [ -d "build" ]; then
+        read -r -p "Existing build directory found. Rebuild from scratch? (y/n): " rebuild
+        [[ "$rebuild" == "y" ]] && rm -rf build
+    fi
+
+    mkdir -p build
+    cd build || { echo -e "${B_RED}Cannot cd into build directory${NC}"; read -r -p "Press Enter..."; return 1; }
+
+    local cmake_flags=()
+
+    case $current_gpu in
+        "NVIDIA")
+            install_Nvidia_gpu_drivers
+            local arch
+            arch=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+                | tr -d '.' | grep -E '^[0-9]+$' | head -n 1 || true)
+            [ -z "$arch" ] && arch="all-major"
+            echo "Using CUDA architecture: $arch" | tee -a "$LOG_FILE"
+            cmake_flags+=("-DGGML_CUDA=ON" "-DCMAKE_CUDA_ARCHITECTURES=$arch")
+            ;;
+        "AMD")
+            install_AMD_gpu_drivers
+            echo "Optimizing for AMD (Vulkan)..." | tee -a "$LOG_FILE"
+            cmake_flags+=("-DGGML_VULKAN=ON" "-DGGML_VULKAN_FLASH_ATTN=ON")
+            ;;
+        "INTEL")
+            install_intel_gpu_drivers
+            echo "Optimizing for Intel Arc (SYCL)..." | tee -a "$LOG_FILE"
+            if source /opt/intel/oneapi/setvars.sh 2>/dev/null; then
+                echo "OneAPI environment loaded." | tee -a "$LOG_FILE"
+                cmake_flags+=("-DGGML_SYCL=ON")
+            else
+                echo -e "${B_RED}[!] Intel OneAPI not found. SYCL build will likely fail.${NC}" | tee -a "$LOG_FILE"
+                read -r -p "Continue anyway with CPU fallback? (y/n): " sycl_fallback
+                [[ "$sycl_fallback" != "y" ]] && { read -r -p "Press Enter..."; return; }
+            fi
+            ;;
+        *)
+            echo "No supported GPU found. Building for CPU only." | tee -a "$LOG_FILE"
+            ;;
+    esac
+
+    cmake_flags+=("-DGGML_CURL=ON" "-DGGML_SERVER_SSL=ON")
+
+    echo "CMake flags: ${cmake_flags[*]}" | tee -a "$LOG_FILE"
+    cmake .. "${cmake_flags[@]}" 2>&1 | tee -a "$LOG_FILE" \
+        || { echo "CMake config failed."; read -r -p "Press Enter..."; return 1; }
+    cmake --build . --config Release -j"$(nproc)" 2>&1 | tee -a "$LOG_FILE" \
+        || { echo "CMake build failed."; read -r -p "Press Enter..."; return 1; }
+
+    rotate_log
+
+    if [ -f "bin/llama-server" ]; then
+        echo -e "\n${B_GREEN}✔ Success: Built for $current_gpu!${NC}"
+        echo -e "${B_YELLOW} Adding $USER to render & video groups…${NC}"
+        sudo usermod -aG render "$USER" || true
+        sudo usermod -aG video  "$USER" || true
+    else
+        echo -e "\n${B_RED}✖ Build failed. Check logs with option 7.${NC}"
+    fi
+    read -r -p "Press Enter to return..."
+}
+
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+#  MODEL BROWSER
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+download_menu() {
+    draw_header
+    echo "Select an AI Brain to download:"
+    echo "1) Llama-3-8B  (Smart mid-size — NousResearch Q4_K_M)"
+    echo "2) Mistral-7B  (Industry standard — TheBloke Q4_K_M)"
+    echo "3) Phi-3-Mini  (Tiny but powerful — bartowski Q4_K_M)"
+    echo "4) Custom URL  (Paste direct GGUF download link)"
+    echo "5) Back"
+    read -r -p "Select [1-5]: " d
+
+    local url filename
+    case $d in
+        1) url="https://huggingface.co/NousResearch/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
+           filename="llama3-8b.gguf" ;;
+        2) url="https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+           filename="mistral-7b.gguf" ;;
+        3) url="https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q4_K_M.gguf"
+           filename="phi3-mini.gguf" ;;
+        4)
+           read -r -p "Paste direct GGUF URL: " url
+           read -r -p "Enter filename to save as (e.g., mymodel.gguf): " filename
+           if [[ -z "$url" || -z "$filename" ]]; then
+               echo -e "${B_RED}Invalid input.${NC}"
+               sleep 1; return
+           fi
+           [[ "$filename" != *.gguf ]] && filename="${filename}.gguf"
+           ;;
+        *) return ;;
+    esac
+
+    mkdir -p "$MODEL_DIR"
+
+    if [[ -f "$MODEL_DIR/$filename" ]]; then
+        echo -e "${B_YELLOW}[!] $filename already exists. Skipping download.${NC}"
+        read -r -p "Press Enter to return..."
+        return
+    fi
+
+    echo -e "${B_CYAN}Downloading $filename...${NC}"
+    if curl -L --fail --progress-bar "$url" -o "$MODEL_DIR/$filename"; then
+        echo -e "${B_GREEN}✔ Download complete: $MODEL_DIR/$filename${NC}"
+    else
+        echo -e "${B_RED}✖ Download failed. The URL may be invalid or gated.${NC}"
+        rm -f "$MODEL_DIR/$filename"
+    fi
+    read -r -p "Press Enter to return..."
+}
+
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+#  SETTINGS — Runtime variable selection menus (NEW)
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+
+# NEW: Interactive context size picker
+select_context_size() {
+    echo -e "\n${B_CYAN}Select Context Window Size:${NC}"
+    echo "  1)  1024  tokens  (minimal RAM, very short conversations)"
+    echo "  2)  2048  tokens"
+    echo "  3)  4096  tokens"
+    echo "  4)  8192  tokens  (current default)"
+    echo "  5) 16384  tokens"
+    echo "  6) 32768  tokens  (large RAM / VRAM required)"
+    echo "  7) Custom"
+    # -r prevents backslash mangling; reading to a fresh variable avoids
+    # any stale input left in the terminal buffer by prior select loops.
+    local c=""
+    read -r -p "Select [1-7]: " c
+    case $c in
+        1) declare -g context_size=1024 ;;
+        2) declare -g context_size=2048 ;;
+        3) declare -g context_size=4096 ;;
+        4) declare -g context_size=8192 ;;
+        5) declare -g context_size=16384 ;;
+        6) declare -g context_size=32768 ;;
+        7)
+           local custom_ctx=""
+           read -r -p "Enter custom context size (min 512): " custom_ctx
+           if [[ "$custom_ctx" =~ ^[0-9]+$ ]] && (( custom_ctx >= 512 )); then
+               declare -g context_size=$custom_ctx
+           else
+               WARN "Invalid value — must be a number ≥ 512. Unchanged."; sleep 1; return
+           fi
+           ;;
+        *) WARN "Invalid selection. Unchanged."; sleep 1; return ;;
+    esac
+    save_settings
+    OK "Context size set to $context_size tokens."
+    sleep 1
+}
+
+# NEW: Interactive network binding picker
+select_network_binding() {
+    echo -e "\n${B_CYAN}Select Network Accessibility:${NC}"
+    echo "  1) 127.0.0.1  — Localhost only  (secure default)"
+    echo "  2) 0.0.0.0    — All interfaces  (LAN / network accessible)"
+    echo "  3) Custom IP"
+    local n=""
+    read -r -p "Select [1-3]: " n
+    case $n in
+        1) declare -g visible2network="127.0.0.1" ;;
+        2)
+           WARN "Server will be reachable on the network. Ensure your firewall is configured."
+           declare -g visible2network="0.0.0.0"
+           ;;
+        3)
+           local custom_ip=""
+           read -r -p "Enter bind address (e.g. 192.168.1.50): " custom_ip
+           if [[ "$custom_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+               declare -g visible2network="$custom_ip"
+           else
+               WARN "Invalid IP format. Unchanged."; sleep 1; return
+           fi
+           ;;
+        *) WARN "Invalid selection. Unchanged."; sleep 1; return ;;
+    esac
+    save_settings
+    OK "Network binding set to $visible2network."
+    sleep 1
+}
+
+# NEW: Interactive port picker
+select_server_port() {
+    echo -e "\n${B_CYAN}Select Server Port:${NC}"
+    echo "  1) 8080  (default)"
+    echo "  2) 8443  (HTTPS convention)"
+    echo "  3) 9000"
+    echo "  4) Custom"
+    local p=""
+    read -r -p "Select [1-4]: " p
+    case $p in
+        1) declare -g network_port="8080" ;;
+EPHEMERAL_KEYS=0
+        2) declare -g network_port="8443" ;;
+EPHEMERAL_KEYS=0
+        3) declare -g network_port="9000" ;;
+EPHEMERAL_KEYS=0
+        4)
+           local custom_port=""
+           read -r -p "Enter custom port (1024–65535): " custom_port
+           if [[ "$custom_port" =~ ^[0-9]+$ ]] && (( custom_port >= 1024 && custom_port <= 65535 )); then
+               declare -g network_port="$custom_port"
+EPHEMERAL_KEYS=0
+           else
+               WARN "Invalid port. Must be 1024–65535. Unchanged."; sleep 1; return
+           fi
+           ;;
+        *) WARN "Invalid selection. Unchanged."; sleep 1; return ;;
+    esac
+    save_settings
+    OK "Server port set to $network_port."
+    sleep 1
+}
+
+# NEW: Settings submenu that ties the three pickers together
+settings_menu() {
+    while true; do
+        draw_header
+        echo -e "${B_CYAN}[ ⚙  RUNTIME SETTINGS ]${NC}"
+        echo -e ""
+        echo -e "  Current values:"
+        echo -e "    Context size  : ${B_YELLOW}$context_size tokens${NC}"
+        echo -e "    Network bind  : ${B_YELLOW}$visible2network${NC}"
+        echo -e "    Server port   : ${B_YELLOW}$network_port${NC}"
+        echo -e ""
+        echo -e "  1) Change Context Size"
+        echo -e "  2) Change Network Binding"
+        echo -e "  3) Change Server Port"
+        echo -e "  4) Back"
+        local s=""
+        read -r -p "Select [1-4]: " s
+        case $s in
+            1) select_context_size ;;
+            2) select_network_binding ;;
+            3) select_server_port ;;
+            4) return ;;
+            *) echo -e "${B_RED}Invalid option.${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+#  GPU LAYER OFFLOAD SELECTOR (replaces free-form numeric prompt)
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+prompt_gpu_layers() {
+    local current_gpu="$1"
+    local default_ngl=0
+    [[ "$current_gpu" != "CPU" ]] && default_ngl=99
+
+    echo -e "\n${B_CYAN}GPU Layer Offload:${NC}" >&2
+    echo -e "  1)  0  — CPU only (no VRAM used)" >&2
+    echo -e "  2) 16  — Partial offload (low VRAM, e.g. 4 GB)" >&2
+    echo -e "  3) 32  — Moderate offload (e.g. 8 GB VRAM)" >&2
+    echo -e "  4) 99  — Full offload  (recommended for GPU)" >&2
+    echo -e "  5) Custom" >&2
+    local ngl_choice=""
+    read -r -p "Select [1-5] (default: $default_ngl layers): " ngl_choice
+
+    case $ngl_choice in
+        1) echo "0" ;;
+        2) echo "16" ;;
+        3) echo "32" ;;
+        4) echo "99" ;;
+        5)
+           local custom_ngl=""
+           read -r -p "Enter number of layers: " custom_ngl
+           if [[ "$custom_ngl" =~ ^[0-9]+$ ]]; then
+               echo "$custom_ngl"
+           else
+               WARN "Invalid input. Using default ($default_ngl)." >&2
+               echo "$default_ngl"
+           fi
+           ;;
+        "") echo "$default_ngl" ;;
+        *)  echo "$default_ngl" ;;
+    esac
+}
+
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+#  MODEL SELECTION HELPER
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
 # ================================================================
 select_model() {
-    shopt -s nullglob
-    local models=("$MODEL_DIR"/*.gguf)
-    shopt -u nullglob
+    local prompt_text="$1"
+    local models_found=0
+    for file in "$MODEL_DIR"/*.gguf; do
+        [[ -f "$file" ]] && { models_found=1; break; }
+    done
 
-    [[ ${#models[@]} -eq 0 ]] && {
-        ERR "No models found."
+    if [[ $models_found -eq 0 ]]; then
+        echo -e "${B_RED}No models found in $MODEL_DIR — download one first.${NC}" >&2
         sleep 2
         return 1
-    }
+    fi
 
+    shopt -s nullglob
+    local models_arr=("$MODEL_DIR"/*.gguf)
+    shopt -u nullglob
+    # Prepend a Cancel entry so the user can always escape
+    local menu_items=("${models_arr[@]}" "── Cancel / Back ──")
     if [[ -f "$LAST_MODEL_FILE" ]]; then
-        read -p "Use last model? (y/n): " use_last
+        read -r -p "Use last model? (y/n): " use_last
         if [[ "$use_last" == "y" ]]; then
             cat "$LAST_MODEL_FILE"
             return 0
         fi
     fi
 
-    PS3="Select model: "
-    select m in "${models[@]}" "Cancel"; do
-        [[ "$m" == "Cancel" ]] && return 1
-        [[ -n "$m" ]] && {
-            echo "$m" > "$LAST_MODEL_FILE"
-            echo "$m"
-            return 0
-        }
+    PS3="Select model [#]: "
+    local selected
+    select selected in "${menu_items[@]}"; do
+        if [[ -z "$selected" ]]; then
+            echo "Invalid selection. Try again (or pick the last option to cancel)." >&2
+        elif [[ "$selected" == "── Cancel / Back ──" ]]; then
+            return 1
+        else
+            break
+        fi
     done
+    echo "$selected"
+echo "$selected" > "$LAST_MODEL_FILE"
 }
 
-# ================================================================
-#  SERVER HEALTH CHECK
-# ================================================================
 check_port_open() {
-    ss -tuln | grep -q ":$network_port"
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
 }
 
 # ================================================================
-#  SERVER MANAGEMENT (IMPROVED)
+#  TERMINAL CHAT
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+chat_mode() {
+    draw_header
+    load_settings   # reload from file — guards against any subshell scope leakage
+    local current_gpu
+    current_gpu=$(detect_gpu)
+
+    local model
+    model=$(select_model "Select model for chat [#]: ") || return
+
+    local ngl
+    ngl=$(prompt_gpu_layers "$current_gpu")
+
+    echo -e "${B_CYAN}Launching chat with $(basename "$model")${NC}"
+    echo -e "${B_YELLOW}  Context: $context_size tokens | GPU layers: $ngl${NC}"
+    echo -e "${B_YELLOW}  (Type /bye to quit or Ctrl+C to force exit)${NC}"
+    echo -e "${B_YELLOW}  --no-context-shift: chat will STOP when context window is full${NC}"
+
+    local chat_exit=0
+    "$BUILD_DIR/bin/llama-cli" \
+        -c "$context_size" \
+        -m "$model" \
+        -ngl "$ngl" \
+        -cnv --prio 2 \
+        --no-context-shift \
+        || chat_exit=$?
+
+    if (( chat_exit != 0 )); then
+        echo -e ""
+        echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+        echo -e "${B_RED}║  Chat ended (exit code $chat_exit)$(printf '%*s' $((31 - ${#chat_exit})) '')║${NC}"
+        echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${B_RED}║${NC}  If the session ran long, the context window  ${B_RED}║${NC}"
+        echo -e "${B_RED}║${NC}  (${B_YELLOW}$context_size tokens${NC}) was likely full.$(printf '%*s' $((14 - ${#context_size})) '')${B_RED}║${NC}"
+        echo -e "${B_RED}║${NC}  Increase it in ${B_YELLOW}Settings → Context Size${NC}.     ${B_RED}║${NC}"
+        echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+    fi
+
+    read -r -p "Press Enter to return to menu..."
+}
+
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
+# ================================================================
+#  HTTPS WEB SERVER
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
 # ================================================================
 manage_server() {
     draw_header
-    load_settings
+    load_settings   # reload from file — guards against any subshell scope leakage
 
     if [[ -f "$SERVER_PID_FILE" ]]; then
-        local pid
-        pid=$(cat "$SERVER_PID_FILE")
-        if ps -p "$pid" > /dev/null 2>&1; then
-            OK "Server running (PID $pid)"
-            read -p "Stop it? (y/n): " s
-            [[ "$s" == "y" ]] && kill "$pid" && rm -f "$SERVER_PID_FILE" "$SERVER_INFO_FILE"
+        local existing_pid
+        existing_pid=$(cat "$SERVER_PID_FILE" 2>/dev/null || echo "")
+        if [[ -n "$existing_pid" ]] && ps -p "$existing_pid" > /dev/null 2>&1; then
+            echo -e "${B_GREEN}Server is running (PID $existing_pid).${NC}"
+            # Show saved connection info if available
+            if [[ -f "$SERVER_INFO_FILE" ]]; then
+                echo -e ""
+                cat "$SERVER_INFO_FILE"
+                echo -e ""
+            fi
+            read -r -p "Stop it? (y/n): " k
+            if [[ "$k" == "y" ]]; then
+                kill "$existing_pid" 2>/dev/null || true
+                rm -f "$SERVER_PID_FILE" "$SERVER_INFO_FILE"
+                echo -e "${B_YELLOW}Server stopped.${NC}"
+            fi
+            read -r -p "Press Enter to return..."
             return
+        else
+            rm -f "$SERVER_PID_FILE" "$SERVER_INFO_FILE"
         fi
     fi
 
+    local current_gpu
+    current_gpu=$(detect_gpu)
+
     local model
-    model=$(select_model) || return
+    model=$(select_model "Select model for server [#]: ") || return
+
+    local ngl
+    ngl=$(prompt_gpu_layers "$current_gpu")
+
+    # Generate self-signed cert if needed
+    local cert_file="$INSTALL_DIR/server.crt"
+    local key_file_ssl="$INSTALL_DIR/server.key"
+    if [[ ! -f "$cert_file" ]]; then
+        echo "Generating self-signed SSL certificate..."
+        openssl req -x509 -newkey rsa:2048 \
+            -keyout "$key_file_ssl" \
+            -out "$cert_file" \
+            -sha256 -days 365 -nodes \
+            -subj "/CN=llama.local" &> /dev/null \
+            || echo "Warning: Failed to generate SSL cert."
+    fi
 
     local api_key
     api_key=$(openssl rand -hex 12)
 
+    # FIX: Derive the display URL from the actual bind address.
+    # If bound to 0.0.0.0 show the LAN IP; otherwise show exactly what
+    # the server is listening on so the URL is always reachable.
+    local display_ip
+    if [[ "$visible2network" == "0.0.0.0" ]]; then
+        display_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [[ -z "$display_ip" ]] && display_ip="0.0.0.0"
+    else
+        display_ip="$visible2network"
+    fi
+    local server_url="https://${display_ip}:${network_port}"
+
+    # FIX: Use --ctx-size (llama-server flag); -c is llama-cli only in
+    #      recent llama.cpp builds and is silently ignored by the server.
     "$BUILD_DIR/bin/llama-server" \
         -m "$model" \
+        -ngl "$ngl" \
         --ctx-size "$context_size" \
         --host "$visible2network" \
         --port "$network_port" \
+        --ssl-key-file "$key_file_ssl" \
+        --ssl-cert-file "$cert_file" \
         --api-key "$api_key" \
         > "$INSTALL_DIR/server.log" 2>&1 &
 
-    local pid=$!
-    echo "$pid" > "$SERVER_PID_FILE"
+    local server_pid=$!
+    echo "$server_pid" > "$SERVER_PID_FILE"
 
-    sleep 2
-
-    if check_port_open; then
-        OK "Server is listening on port $network_port"
-    else
-        WARN "Server may not have started correctly"
-    fi
-
-    if [[ $EPHEMERAL_KEYS -eq 0 ]]; then
-        echo "[$(date)] PID=$pid KEY=${api_key:0:4}****" >> "$KEY_FILE"
-        chmod 600 "$KEY_FILE"
-    fi
-
-    echo "URL: http://$visible2network:$network_port"
-    echo "KEY: $api_key"
-
-    read -p "Press Enter..."
-}
-
-# ================================================================
-#  BUILD ENGINE (SAFE EXEC)
-# ================================================================
-build_engine() {
-    draw_header
-
-    ensure_apt_updated
-
-    run_or_fail sudo apt-get install -y \
-        build-essential cmake git curl \
-        libssl-dev libcurl4-openssl-dev \
-        ocl-icd-libopencl1 &>> "$LOG_FILE" || return
-
-    mkdir -p "$HOME/ai_stack"
-
-    if [[ ! -d "$INSTALL_DIR/.git" ]]; then
-        run_or_fail git clone https://github.com/ggerganov/llama.cpp.git "$INSTALL_DIR" || return
-    else
-        (cd "$INSTALL_DIR" && git pull) || true
-    fi
-
-    mkdir -p "$BUILD_DIR"
-    cd "$BUILD_DIR" || return
-
-    cmake .. -DGGML_CURL=ON &>> "$LOG_FILE" || return
-    cmake --build . -j"$(nproc)" &>> "$LOG_FILE" || return
-
-    OK "Build complete"
-    read -p "Enter to continue"
-}
-
-# ================================================================
-#  CHAT MODE
-# ================================================================
-chat_mode() {
-    draw_header
-
-    local model
-    model=$(select_model) || return
-
-    "$BUILD_DIR/bin/llama-cli" \
-        -m "$model" \
-        -c "$context_size" \
-        -cnv
-}
-
-# ================================================================
-#  SETTINGS MENU
-# ================================================================
-settings_menu() {
-    while true; do
-        draw_header
-        echo "1) Context ($context_size)"
-        echo "2) Port ($network_port)"
-        echo "3) Toggle Ephemeral Keys ($EPHEMERAL_KEYS)"
-        echo "4) Back"
-        read -p "Choice: " s
-
-        case $s in
-            1) read -p "New context: " context_size ;;
-            2) read -p "New port: " network_port ;;
-            3) EPHEMERAL_KEYS=$((1-EPHEMERAL_KEYS)) ;;
-            4) save_settings; return ;;
-        esac
+    # Wait up to 4 s for the server to confirm it started
+    local started=0
+    for _ in 1 2 3 4; do
+        sleep 1
+        if ! ps -p "$server_pid" > /dev/null 2>&1; then
+            echo -e "\n${B_RED}✖ Server process died immediately. Check logs:${NC}"
+            echo -e "   $INSTALL_DIR/server.log"
+            tail -n 20 "$INSTALL_DIR/server.log" 2>/dev/null || true
+            rm -f "$SERVER_PID_FILE"
+            read -r -p "Press Enter to return..."
+            return 1
+        fi
+        grep -q "HTTP server listening" "$INSTALL_DIR/server.log" 2>/dev/null && { started=1; break; }
     done
+
+    # Persist connection info for the status display (readable by main loop)
+    {
+        echo -e "  ${B_GREEN}URL  :${NC} ${B_CYAN}${server_url}${NC}"
+        echo -e "  ${B_GREEN}Key  :${NC} ${B_YELLOW}${api_key}${NC}"
+        echo -e "  ${B_GREEN}Model:${NC} $(basename "$model")  |  ctx ${context_size}t  |  ${ngl} GPU layers"
+    } > "$SERVER_INFO_FILE"
+    chmod 600 "$SERVER_INFO_FILE" 2>/dev/null || true
+
+    # Persist to the audit log
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] PID=$server_pid | $(basename "$model") | ngl=$ngl | ctx=$context_size | bind=$visible2network | url=$server_url | key=${api_key:0:4}****" >> "$KEY_FILE"
+    chmod 600 "$KEY_FILE" 2>/dev/null || true
+
+    echo -e ""
+    echo -e "${B_GREEN}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "${B_GREEN}║  🚀  SERVER LIVE                             ║${NC}"
+if check_port_open; then
+    OK "Server is listening on port $network_port"
+else
+    WARN "Server may not have started correctly"
+fi
+
+    echo -e "${B_GREEN}╠══════════════════════════════════════════════╣${NC}"
+    printf "${B_GREEN}║${NC}  %-12s ${B_CYAN}%-31s${NC} ${B_GREEN}║${NC}\n" "URL:" "$server_url"
+    printf "${B_GREEN}║${NC}  %-12s ${B_YELLOW}%-31s${NC} ${B_GREEN}║${NC}\n" "API Key:" "$api_key"
+    printf "${B_GREEN}║${NC}  %-12s %-31s ${B_GREEN}║${NC}\n" "Context:" "${context_size} tokens"
+    printf "${B_GREEN}║${NC}  %-12s %-31s ${B_GREEN}║${NC}\n" "Bind addr:" "$visible2network:$network_port"
+    [[ $started -eq 0 ]] && \
+    printf "${B_YELLOW}║${NC}  %-44s ${B_YELLOW}║${NC}\n" "⚠  Startup not confirmed yet — check logs"
+    echo -e "${B_GREEN}╚══════════════════════════════════════════════╝${NC}"
+    echo -e "   Logs: $INSTALL_DIR/server.log"
+    echo -e "   Keys: $KEY_FILE"
+    echo -e "   Note: Accept the self-signed cert warning in your browser."
+    read -r -p "Press Enter to return..."
+}
+
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
 }
 
 # ================================================================
 #  MAIN LOOP
+check_port_open() {
+    ss -tuln 2>/dev/null | grep -q ":$network_port"
+}
+
 # ================================================================
+rotate_log
+
 while true; do
     draw_header
+    CUR_GPU=$(detect_gpu)
 
-    echo "GPU: $(detect_gpu)"
-    echo "Context: $context_size"
-    echo "Port: $network_port"
+    echo -e "${B_YELLOW}[ SYSTEM STATUS ]${NC}"
+    echo -e "  Detected GPU:  ${B_CYAN}$CUR_GPU${NC}"
+    echo -e "  Context size:  ${B_CYAN}$context_size tokens${NC}"
+    echo -e "  Network bind:  ${B_CYAN}$visible2network:$network_port${NC}"
 
-    echo "1) Build"
-    echo "2) Chat"
-    echo "3) Server"
-    echo "4) Settings"
-    echo "5) Exit"
+    if [ -f "$BUILD_DIR/bin/llama-server" ]; then
+        echo -e "  AI Engine:     ${B_GREEN}✓ INSTALLED${NC}"
+    else
+        echo -e "  AI Engine:     ${B_RED}✗ NOT BUILT${NC}"
+    fi
 
-    read -p "Action: " c
+    if [[ -f "$SERVER_PID_FILE" ]]; then
+        SRV_PID=$(cat "$SERVER_PID_FILE" 2>/dev/null || echo "")
+        if [[ -n "$SRV_PID" ]] && ps -p "$SRV_PID" > /dev/null 2>&1; then
+            echo -e "  Web Server:    ${B_GREEN}✓ RUNNING (PID $SRV_PID)${NC}"
+            if [[ -f "$SERVER_INFO_FILE" ]]; then
+                cat "$SERVER_INFO_FILE"
+            fi
+        else
+            echo -e "  Web Server:    ${B_YELLOW}⚠ PID file stale — server not running${NC}"
+            rm -f "$SERVER_PID_FILE" "$SERVER_INFO_FILE"
+        fi
+    else
+        echo -e "  Web Server:    ${B_RED}✗ STOPPED${NC}"
+    fi
 
-    case $c in
+    MODELS_COUNT=$(find "$MODEL_DIR" -name "*.gguf" 2>/dev/null | wc -l || echo 0)
+    echo -e "  Models:        ${B_CYAN}$MODELS_COUNT downloaded${NC}"
+
+    echo -e "------------------------------------------------------"
+    echo -e "1) ${B_CYAN}Build AI Engine${NC}     (Auto-Detect: $CUR_GPU)"
+    echo -e "2) ${B_CYAN}Download Models${NC}     (Includes Custom URL option)"
+    echo -e "3) ${B_GREEN}Interactive Chat${NC}"
+    echo -e "4) ${B_GREEN}Start / Stop Web Server${NC}"
+    echo -e "5) ${B_YELLOW}⚙  Settings${NC}          (Context, Port, Network)"
+    echo -e "6) ${B_RED}DEEP REPAIR${NC}         (Fix Drivers/Conflicts)"
+    echo -e "7) View Forensic Logs"
+    echo -e "8) View Saved API Keys"
+    echo -e "9) Exit"
+    read -r -p "Action: " choice
+
+    case $choice in
         1) build_engine ;;
-        2) chat_mode ;;
-        3) manage_server ;;
-        4) settings_menu ;;
-        5) exit 0 ;;
+        2) download_menu ;;
+        3) chat_mode ;;
+        4) manage_server ;;
+        5) settings_menu ;;
+        6) deep_repair ;;
+        7)
+            draw_header
+            echo -e "${B_CYAN}--- Last 50 lines of $LOG_FILE ---${NC}"
+            tail -n 50 "$LOG_FILE" 2>/dev/null || echo "(Log file is empty or missing)"
+            read -r -p "Press Enter to return..."
+            ;;
+        8)
+            draw_header
+            echo -e "${B_CYAN}--- Saved API Keys ($KEY_FILE) ---${NC}"
+            cat "$KEY_FILE" 2>/dev/null || echo "(No keys saved yet)"
+            read -r -p "Press Enter to return..."
+            ;;
+        9) echo -e "${B_CYAN}Goodbye!${NC}"; exit 0 ;;
+        *) echo -e "${B_RED}Invalid option.${NC}"; sleep 1 ;;
     esac
 done
