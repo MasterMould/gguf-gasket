@@ -30,11 +30,13 @@ SERVER_PID_FILE="/tmp/llama_server.pid"
 KEY_FILE="$HOME/llama_api_keys.log"
 SERVER_INFO_FILE="/tmp/llama_server.info"   # stores active URL + API key for status display
 SETTINGS_FILE="$HOME/ai_stack/settings.env" # persists runtime settings across sessions
+DL_DIR="$HOME/ai_stack/.downloads"          # tracks background download progress files
 
 # --- Config (all overridable at runtime via the Settings menu) ---
 context_size=8192         # tokens: 1024 2048 4096 8192 16384 32768
 visible2network="127.0.0.1"   # 0.0.0.0 = LAN-accessible  127.0.0.1 = localhost only
 network_port="8080"
+api_key_mode="random"     # "random" | "localtest" | "custom:<value>"
 
 # Persist settings to file so they survive subshell scope issues and script restarts.
 save_settings() {
@@ -44,6 +46,7 @@ save_settings() {
         echo "context_size=$context_size"
         echo "visible2network=$visible2network"
         echo "network_port=$network_port"
+        echo "api_key_mode=$api_key_mode"
     } > "$SETTINGS_FILE" || WARN "Could not write settings to $SETTINGS_FILE"
 }
 
@@ -429,54 +432,195 @@ build_engine() {
 }
 
 # ================================================================
-#  MODEL BROWSER
+#  BACKGROUND DOWNLOAD ENGINE
+#  Spawns a new terminal window so downloads don't block the menu.
+#  Progress is tracked via per-download state files in DL_DIR.
 # ================================================================
-download_menu() {
-    draw_header
-    echo "Select an AI Brain to download:"
-    echo "1) Llama-3-8B  (Smart mid-size — NousResearch Q4_K_M)"
-    echo "2) Mistral-7B  (Industry standard — TheBloke Q4_K_M)"
-    echo "3) Phi-3-Mini  (Tiny but powerful — bartowski Q4_K_M)"
-    echo "4) Custom URL  (Paste direct GGUF download link)"
-    echo "5) Back"
-    read -p "Select [1-5]: " d
 
-    local url filename
-    case $d in
-        1) url="https://huggingface.co/NousResearch/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
-           filename="llama3-8b.gguf" ;;
-        2) url="https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
-           filename="mistral-7b.gguf" ;;
-        3) url="https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q4_K_M.gguf"
-           filename="phi3-mini.gguf" ;;
-        4)
-           read -p "Paste direct GGUF URL: " url
-           read -p "Enter filename to save as (e.g., mymodel.gguf): " filename
-           if [[ -z "$url" || -z "$filename" ]]; then
-               echo -e "${B_RED}Invalid input.${NC}"
-               sleep 1; return
-           fi
-           [[ "$filename" != *.gguf ]] && filename="${filename}.gguf"
-           ;;
-        *) return ;;
-    esac
+# Find best available terminal emulator
+find_terminal() {
+    for term in x-terminal-emulator gnome-terminal xterm konsole xfce4-terminal lxterminal mate-terminal; do
+        command -v "$term" &>/dev/null && echo "$term" && return
+    done
+    echo ""
+}
 
-    mkdir -p "$MODEL_DIR"
+# Show a one-line summary of any active/completed downloads in the status bar
+show_download_status() {
+    [[ -d "$DL_DIR" ]] || return 0
+    local active=0 done_count=0 failed=0
+    for f in "$DL_DIR"/*.status 2>/dev/null; do
+        [[ -f "$f" ]] || continue
+        local st
+        st=$(cat "$f" 2>/dev/null || echo "")
+        case "$st" in
+            RUNNING)   (( active++ )) ;;
+            DONE)      (( done_count++ )) ;;
+            FAILED)    (( failed++ )) ;;
+        esac
+    done
+    (( active > 0 ))      && echo -e "  Downloads:     ${B_YELLOW}⬇  $active in progress${NC}"
+    (( done_count > 0 ))  && echo -e "  Downloads:     ${B_GREEN}✔  $done_count completed (clear with option 2)${NC}"
+    (( failed > 0 ))      && echo -e "  Downloads:     ${B_RED}✖  $failed failed (check logs)${NC}"
+}
+
+# The actual download worker — run inside the spawned terminal
+_download_worker() {
+    local url="$1" filename="$2" dest="$3" state_file="$4"
+    echo "RUNNING" > "$state_file"
+    echo ""
+    echo "  Downloading: $filename"
+    echo "  To:          $dest/$filename"
+    echo "  Source:      $url"
+    echo ""
+    if curl -L --fail --progress-bar "$url" -o "$dest/$filename.part"; then
+        mv "$dest/$filename.part" "$dest/$filename"
+        echo "DONE" > "$state_file"
+        echo ""
+        echo "  ✔ Download complete: $dest/$filename"
+    else
+        echo "FAILED" > "$state_file"
+        rm -f "$dest/$filename.part"
+        echo ""
+        echo "  ✖ Download FAILED for $filename"
+        echo "  URL may be invalid, gated, or network issue."
+    fi
+    echo ""
+    read -rp "  Press Enter to close this window..."
+}
+# Export so the spawned bash -c subshell can call it
+export -f _download_worker
+
+spawn_download() {
+    local url="$1" filename="$2"
+    mkdir -p "$MODEL_DIR" "$DL_DIR"
 
     if [[ -f "$MODEL_DIR/$filename" ]]; then
-        echo -e "${B_YELLOW}[!] $filename already exists. Skipping download.${NC}"
-        read -p "Press Enter to return..."
+        echo -e "${B_YELLOW}[!] $filename already exists. Skipping.${NC}"
+        sleep 2; return
+    fi
+
+    # Sanitise filename for use as a state-file name (strip slashes etc.)
+    local safe_name="${filename//[^a-zA-Z0-9._-]/_}"
+    local state_file="$DL_DIR/${safe_name}.status"
+    echo "QUEUED" > "$state_file"
+
+    local term
+    term=$(find_terminal)
+
+    if [[ -z "$term" ]]; then
+        # No terminal emulator found — fall back to background process with log
+        WARN "No terminal emulator found. Downloading in background (no progress bar)."
+        (
+            if curl -L --fail -s "$url" -o "$MODEL_DIR/$filename.part"; then
+                mv "$MODEL_DIR/$filename.part" "$MODEL_DIR/$filename"
+                echo "DONE" > "$state_file"
+            else
+                echo "FAILED" > "$state_file"
+                rm -f "$MODEL_DIR/$filename.part"
+            fi
+        ) >> "$LOG_FILE" 2>&1 &
+        OK "Download started in background (PID $!). Check status on main menu."
+        sleep 2
         return
     fi
 
-    echo -e "${B_CYAN}Downloading $filename...${NC}"
-    if curl -L --fail --progress-bar "$url" -o "$MODEL_DIR/$filename"; then
-        echo -e "${B_GREEN}✔ Download complete: $MODEL_DIR/$filename${NC}"
-    else
-        echo -e "${B_RED}✖ Download failed. The URL may be invalid or gated.${NC}"
-        rm -f "$MODEL_DIR/$filename"
-    fi
-    read -p "Press Enter to return..."
+    # Build the command that will run inside the new terminal
+    local worker_cmd="bash -c '_download_worker \"\$1\" \"\$2\" \"\$3\" \"\$4\"' _ \
+        $(printf '%q' "$url") \
+        $(printf '%q' "$filename") \
+        $(printf '%q' "$MODEL_DIR") \
+        $(printf '%q' "$state_file")"
+
+    case "$term" in
+        gnome-terminal)
+            gnome-terminal -- bash -c "_download_worker $(printf '%q' "$url") $(printf '%q' "$filename") $(printf '%q' "$MODEL_DIR") $(printf '%q' "$state_file")" &
+            ;;
+        xterm|lxterminal|mate-terminal|xfce4-terminal|konsole)
+            "$term" -e "bash -c \"_download_worker $(printf '%q' "$url") $(printf '%q' "$filename") $(printf '%q' "$MODEL_DIR") $(printf '%q' "$state_file")\"" &
+            ;;
+        x-terminal-emulator)
+            x-terminal-emulator -e "bash -c \"_download_worker $(printf '%q' "$url") $(printf '%q' "$filename") $(printf '%q' "$MODEL_DIR") $(printf '%q' "$state_file")\"" &
+            ;;
+    esac
+
+    OK "Download window opened for $filename — you can continue using the menu."
+    sleep 2
+}
+
+# ================================================================
+#  MODEL BROWSER
+# ================================================================
+download_menu() {
+    while true; do
+        draw_header
+        echo -e "${B_CYAN}[ 📥  MODEL DOWNLOADER ]${NC}"
+        echo ""
+
+        # Show active downloads
+        if [[ -d "$DL_DIR" ]]; then
+            local any_shown=0
+            for f in "$DL_DIR"/*.status 2>/dev/null; do
+                [[ -f "$f" ]] || continue
+                local name st
+                name=$(basename "$f" .status)
+                st=$(cat "$f" 2>/dev/null || echo "?")
+                case "$st" in
+                    RUNNING) echo -e "  ${B_YELLOW}⬇ DOWNLOADING:${NC} $name" ;;
+                    DONE)    echo -e "  ${B_GREEN}✔ COMPLETE:${NC}    $name" ;;
+                    FAILED)  echo -e "  ${B_RED}✖ FAILED:${NC}      $name" ;;
+                    QUEUED)  echo -e "  ${B_CYAN}⏳ QUEUED:${NC}      $name" ;;
+                esac
+                any_shown=1
+            done
+            (( any_shown )) && echo ""
+        fi
+
+        echo "  Select model to download:"
+        echo "  1) Llama-3-8B  (Smart mid-size — NousResearch Q4_K_M ~4.9 GB)"
+        echo "  2) Mistral-7B  (Industry standard — TheBloke Q4_K_M ~4.1 GB)"
+        echo "  3) Phi-3-Mini  (Tiny but powerful — bartowski Q4_K_M ~2.2 GB)"
+        echo "  4) Custom URL  (Paste direct GGUF link)"
+        echo "  5) Clear completed/failed status entries"
+        echo "  6) Back"
+        echo ""
+        local d=""
+        read -r -p "  Select [1-6]: " d
+
+        local url="" filename=""
+        case $d in
+            1) url="https://huggingface.co/NousResearch/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
+               filename="llama3-8b.gguf" ;;
+            2) url="https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+               filename="mistral-7b.gguf" ;;
+            3) url="https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q4_K_M.gguf"
+               filename="phi3-mini.gguf" ;;
+            4)
+               read -r -p "  Paste GGUF URL: " url
+               read -r -p "  Save as filename (.gguf): " filename
+               if [[ -z "$url" || -z "$filename" ]]; then
+                   echo -e "${B_RED}Invalid input.${NC}"; sleep 1; continue
+               fi
+               [[ "$filename" != *.gguf ]] && filename="${filename}.gguf"
+               ;;
+            5)
+               if [[ -d "$DL_DIR" ]]; then
+                   for f in "$DL_DIR"/*.status 2>/dev/null; do
+                       [[ -f "$f" ]] || continue
+                       local st; st=$(cat "$f" 2>/dev/null || echo "")
+                       [[ "$st" == "DONE" || "$st" == "FAILED" ]] && rm -f "$f"
+                   done
+                   OK "Cleared completed/failed entries."
+               fi
+               sleep 1; continue
+               ;;
+            6) return ;;
+            *) echo -e "${B_RED}Invalid option.${NC}"; sleep 1; continue ;;
+        esac
+
+        # Kick off non-blocking download
+        spawn_download "$url" "$filename"
+    done
 }
 
 # ================================================================
@@ -492,7 +636,7 @@ select_context_size() {
     echo "  4)  8192  tokens  (current default)"
     echo "  5) 16384  tokens"
     echo "  6) 32768  tokens  (large RAM / VRAM required)"
-    echo "  7) Custom"
+    echo "  7) Type a number manually"
     # -r prevents backslash mangling; reading to a fresh variable avoids
     # any stale input left in the terminal buffer by prior select loops.
     local c=""
@@ -506,7 +650,7 @@ select_context_size() {
         6) declare -g context_size=32768 ;;
         7)
            local custom_ctx=""
-           read -r -p "Enter custom context size (min 512): " custom_ctx
+           read -r -p "  Enter context size (min 512): " custom_ctx
            if [[ "$custom_ctx" =~ ^[0-9]+$ ]] && (( custom_ctx >= 512 )); then
                declare -g context_size=$custom_ctx
            else
@@ -517,6 +661,38 @@ select_context_size() {
     esac
     save_settings
     OK "Context size set to $context_size tokens."
+    sleep 1
+}
+
+# NEW: API key mode picker
+select_api_key_mode() {
+    echo -e "\n${B_CYAN}Select API Key Mode:${NC}"
+    echo "  Current mode: ${B_YELLOW}${api_key_mode}${NC}"
+    echo ""
+    echo "  1) Random     — new 24-char hex key generated each server start (default)"
+    echo "  2) localtest  — fixed key 'localtest' for local curl/dev testing"
+    echo "  3) Custom     — type your own key"
+    local a=""
+    read -r -p "  Select [1-3]: " a
+    case $a in
+        1) declare -g api_key_mode="random" ;;
+        2) declare -g api_key_mode="localtest"
+           WARN "Key 'localtest' is predictable — only use on localhost." ;;
+        3)
+           local custom_key=""
+           read -r -p "  Enter API key (min 8 chars): " custom_key
+           if [[ ${#custom_key} -ge 8 ]]; then
+               declare -g api_key_mode="custom:${custom_key}"
+           else
+               WARN "Key too short (min 8 chars). Unchanged."; sleep 1; return
+           fi
+           ;;
+        *) WARN "Invalid selection. Unchanged."; sleep 1; return ;;
+    esac
+    save_settings
+    local display_mode="$api_key_mode"
+    [[ "$api_key_mode" == custom:* ]] && display_mode="custom (${api_key_mode#custom:})"
+    OK "API key mode set to: $display_mode"
     sleep 1
 }
 
