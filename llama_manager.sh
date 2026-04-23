@@ -98,44 +98,65 @@ draw_header() {
 #      AFTER 'return 0' and could never execute. Moved above return.
 # ================================================================
 check_deps() {
-    local missing=()
-    for cmd in git cmake curl openssl lspci ccache nproc; do
-        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    # 1. Define the mapping of command -> package name
+    declare -A deps=(
+        ["git"]="git"
+        ["cmake"]="cmake"
+        ["curl"]="curl"
+        ["openssl"]="openssl"
+        ["lspci"]="pciutils"
+        ["ccache"]="ccache"
+        ["nproc"]="coreutils"
+    )
+
+    local missing_pkgs=()
+    local found_missing=false
+
+    # 2. Check for missing commands
+    for cmd in "${!deps[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_pkgs+=("${deps[$cmd]}")
+            found_missing=true
+        fi
     done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        echo -e "${B_RED}[!] Missing required tools: ${missing[*]}${NC}"
-        echo -e "    Install with: sudo apt install ${missing[*]}"
-        echo -e "    (pciutils provides lspci; coreutils provides nproc)"
-        return 1
+
+    # 3. Handle Installation
+    if [ "$found_missing" = true ]; then
+        echo -e "${B_YELLOW}[!] Missing required tools. Attempting to install: ${missing_pkgs[*]}${NC}"
+        
+        # Check if apt is available (Debian/Ubuntu)
+        if command -v apt-get &>/dev/null; then
+            sudo apt-get update
+            if sudo apt-get install -y "${missing_pkgs[@]}"; then
+                echo -e "${B_GREEN}[✔] Dependencies installed successfully.${NC}"
+            else
+                echo -e "${B_RED}[X] Failed to install dependencies. Please check your internet or permissions.${NC}"
+                return 1
+            fi
+        else
+            echo -e "${B_RED}[X] 'apt' package manager not found. Please install manually: ${missing_pkgs[*]}${NC}"
+            return 1
+        fi
     fi
 
-    # Validate x86_64 platform (was unreachable before)
+    # 4. Validate x86_64 platform
     if [[ "$(uname -m)" != "x86_64" ]]; then
-        ERR "x86_64 architecture required. Detected: $(uname -m)"
+        echo -e "${B_RED}[X] Architecture Error: x86_64 required. Detected: $(uname -m)${NC}"
         return 1
     fi
 
+    # 5. System Information Display
     echo ""
-    INFO "Available disk: $(df -h "$HOME" | awk 'NR==2{print $4}') free"
-    INFO "System RAM:     $(free -h | awk '/Mem:/ {print $2}')"
-    WARN "The 8B model download is ~5 GB. Ensure you have ~8 GB free total."
+    echo -e "${B_CYAN}--- System Specs ---${NC}"
+    echo -e "  Available disk: $(df -h "$HOME" | awk 'NR==2{print $4}') free"
+    echo -e "  System RAM:     $(free -h | awk '/Mem:/ {print $2}')"
+    echo -e "${B_YELLOW}  Note: The 8B model is ~5 GB. Total ~8 GB free recommended.${NC}"
+    
     return 0
 }
 
 # ================================================================
 #  HARDWARE DETECTION ENGINE
-#
-#  FIX: install_AMD_gpu_drivers() and install_intel_gpu_drivers()
-#       were called directly inside detect_gpu(). This caused driver
-#       installation to trigger on every single status check and menu
-#       refresh — a serious unintended side-effect. Detection now only
-#       prints the GPU type; installation is left to build_engine()
-#       and deep_repair() where it belongs.
-#
-#  FIX: The Intel elif block contained orphaned if/else statements
-#       (Arc OpenCL and lspci checks) that ran after 'echo "INTEL"'
-#       but produced no useful return value and mixed stdout with the
-#       detect_gpu output, breaking callers.
 # ================================================================
 detect_gpu() {
     local gpu_info
@@ -154,7 +175,6 @@ detect_gpu() {
 
 # ================================================================
 #  GPU DRIVER INSTALLERS
-#  These are now called explicitly from build_engine / deep_repair.
 # ================================================================
 
 install_Nvidia_gpu_drivers() {
@@ -325,13 +345,6 @@ deep_repair() {
 
 # ================================================================
 #  SMART BUILD ENGINE
-#
-#  FIX 1: 'sudo apt-get install -y' with no packages (bare command)
-#          was left on its own line and would error — removed.
-#  FIX 2: Continuation backslash had a trailing space ('cmake \ ')
-#          which breaks line continuation — fixed.
-#  FIX 3: install_AMD/INTEL gpu drivers are now called here during
-#          build so the correct stack is present before compiling.
 # ================================================================
 build_engine() {
     draw_header
@@ -449,19 +462,19 @@ find_terminal() {
 show_download_status() {
     [[ -d "$DL_DIR" ]] || return 0
     local active=0 done_count=0 failed=0
-    for f in "$DL_DIR"/*.status 2>/dev/null; do
+    for f in "$DL_DIR"/*.status; do
         [[ -f "$f" ]] || continue
         local st
-        st=$(cat "$f" 2>/dev/null || echo "")
+        st=$(<"$f") # Faster Bash-native way to read files
         case "$st" in
-            RUNNING)   (( active++ )) ;;
-            DONE)      (( done_count++ )) ;;
-            FAILED)    (( failed++ )) ;;
+            RUNNING) (( active++ )) ;;
+            DONE)    (( done_count++ )) ;;
+            FAILED)  (( failed++ )) ;;
         esac
-    done
-    (( active > 0 ))      && echo -e "  Downloads:     ${B_YELLOW}⬇  $active in progress${NC}"
-    (( done_count > 0 ))  && echo -e "  Downloads:     ${B_GREEN}✔  $done_count completed (clear with option 2)${NC}"
-    (( failed > 0 ))      && echo -e "  Downloads:     ${B_RED}✖  $failed failed (check logs)${NC}"
+    done 2>/dev/null
+    (( active > 0 ))     && echo -e "  Downloads:      ${B_YELLOW}⬇  $active in progress${NC}"
+    (( done_count > 0 ))  && echo -e "  Downloads:      ${B_GREEN}✔  $done_count completed (clear with option 2)${NC}"
+    (( failed > 0 ))      && echo -e "  Downloads:      ${B_RED}✖  $failed failed (check logs)${NC}"
 }
 
 # The actual download worker — run inside the spawned terminal
@@ -560,7 +573,7 @@ download_menu() {
         # Show active downloads
         if [[ -d "$DL_DIR" ]]; then
             local any_shown=0
-            for f in "$DL_DIR"/*.status 2>/dev/null; do
+            for f in "$DL_DIR"/*.status; do
                 [[ -f "$f" ]] || continue
                 local name st
                 name=$(basename "$f" .status)
@@ -572,7 +585,7 @@ download_menu() {
                     QUEUED)  echo -e "  ${B_CYAN}⏳ QUEUED:${NC}      $name" ;;
                 esac
                 any_shown=1
-            done
+            done  2>/dev/null
             (( any_shown )) && echo ""
         fi
 
@@ -605,11 +618,11 @@ download_menu() {
                ;;
             5)
                if [[ -d "$DL_DIR" ]]; then
-                   for f in "$DL_DIR"/*.status 2>/dev/null; do
+                   for f in "$DL_DIR"/*.status; do
                        [[ -f "$f" ]] || continue
                        local st; st=$(cat "$f" 2>/dev/null || echo "")
                        [[ "$st" == "DONE" || "$st" == "FAILED" ]] && rm -f "$f"
-                   done
+                   done  2>/dev/null
                    OK "Cleared completed/failed entries."
                fi
                sleep 1; continue
@@ -696,7 +709,7 @@ select_api_key_mode() {
     sleep 1
 }
 
-# NEW: Interactive network binding picker
+# Interactive network binding picker
 select_network_binding() {
     echo -e "\n${B_CYAN}Select Network Accessibility:${NC}"
     echo "  1) 127.0.0.1  — Localhost only  (secure default)"
@@ -726,7 +739,7 @@ select_network_binding() {
     sleep 1
 }
 
-# NEW: Interactive port picker
+# Interactive port picker
 select_server_port() {
     echo -e "\n${B_CYAN}Select Server Port:${NC}"
     echo "  1) 8080  (default)"
@@ -755,7 +768,7 @@ select_server_port() {
     sleep 1
 }
 
-# NEW: Settings submenu that ties the three pickers together
+# Settings submenu that ties the three pickers together
 settings_menu() {
     while true; do
         draw_header
@@ -963,7 +976,7 @@ manage_server() {
     fi
     local server_url="https://${display_ip}:${network_port}"
 
-    # FIX: Use --ctx-size (llama-server flag); -c is llama-cli only in
+    # Use --ctx-size (llama-server flag); -c is llama-cli only in
     #      recent llama.cpp builds and is silently ignored by the server.
     "$BUILD_DIR/bin/llama-server" \
         -m "$model" \
@@ -1093,6 +1106,6 @@ while true; do
             read -p "Press Enter to return..."
             ;;
         9) echo -e "${B_CYAN}Goodbye!${NC}"; exit 0 ;;
-        *) echo -e "${B_RED}Invalid option.${NC}"; sleep 1 ;;
+        *) echo -e "${B_RED}Invalid option.${NC}"; sleep 2 ;;
     esac
 done
