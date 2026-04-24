@@ -94,69 +94,91 @@ draw_header() {
 
 # ================================================================
 #  PREFLIGHT DEPENDENCY CHECK
-# FIX: Unreachable code (platform check, disk info, ask) was placed
-#      AFTER 'return 0' and could never execute. Moved above return.
+#  Detects missing tools, offers to auto-install them, re-verifies.
 # ================================================================
 check_deps() {
-    # 1. Define the mapping of command -> package name
-    declare -A deps=(
-        ["git"]="git"
-        ["cmake"]="cmake"
-        ["curl"]="curl"
-        ["openssl"]="openssl"
-        ["lspci"]="pciutils"
-        ["ccache"]="ccache"
-        ["nproc"]="coreutils"
+    # Map: command -> apt package that provides it
+    declare -A PKG_MAP=(
+        [git]="git"
+        [cmake]="cmake"
+        [curl]="curl"
+        [openssl]="openssl"
+        [lspci]="pciutils"
+        [ccache]="ccache"
+        [nproc]="coreutils"
+        [wget]="wget"
+        [gpg]="gnupg2"
     )
 
-    local missing_pkgs=()
-    local found_missing=false
-
-    # 2. Check for missing commands
-    for cmd in "${!deps[@]}"; do
+    local missing_cmds=() missing_pkgs=()
+    for cmd in "${!PKG_MAP[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
-            missing_pkgs+=("${deps[$cmd]}")
-            found_missing=true
+            missing_cmds+=("$cmd")
+            missing_pkgs+=("${PKG_MAP[$cmd]}")
         fi
     done
 
-    # 3. Handle Installation
-    if [ "$found_missing" = true ]; then
-        echo -e "${B_YELLOW}[!] Missing required tools. Attempting to install: ${missing_pkgs[*]}${NC}"
-        
-        # Check if apt is available (Debian/Ubuntu)
-        if command -v apt-get &>/dev/null; then
-            sudo apt-get update
-            if sudo apt-get install -y "${missing_pkgs[@]}"; then
-                echo -e "${B_GREEN}[✔] Dependencies installed successfully.${NC}"
+    if [[ ${#missing_cmds[@]} -gt 0 ]]; then
+        echo -e "${B_YELLOW}[!] Missing tools: ${missing_cmds[*]}${NC}"
+        echo -e "    Packages needed: ${missing_pkgs[*]}"
+        echo ""
+        read -r -p "    Auto-install missing packages now? (y/n): " do_install
+        if [[ "${do_install,,}" == "y" ]]; then
+            echo -e "${B_CYAN}  Running apt-get update…${NC}"
+            sudo apt-get update -qq &>> "$LOG_FILE" || true
+            echo -e "${B_CYAN}  Installing: ${missing_pkgs[*]}…${NC}"
+            # De-duplicate package list before installing
+            local unique_pkgs
+            mapfile -t unique_pkgs < <(printf '%s\n' "${missing_pkgs[@]}" | sort -u)
+            if sudo apt-get install -y "${unique_pkgs[@]}" &>> "$LOG_FILE"; then
+                OK "Packages installed."
             else
-                echo -e "${B_RED}[X] Failed to install dependencies. Please check your internet or permissions.${NC}"
+                ERR "apt-get install failed — check logs."
                 return 1
             fi
+            # Re-verify after install
+            local still_missing=()
+            for cmd in "${missing_cmds[@]}"; do
+                command -v "$cmd" &>/dev/null || still_missing+=("$cmd")
+            done
+            if [[ ${#still_missing[@]} -gt 0 ]]; then
+                ERR "Still missing after install: ${still_missing[*]}"
+                return 1
+            fi
+            OK "All dependencies satisfied."
         else
-            echo -e "${B_RED}[X] 'apt' package manager not found. Please install manually: ${missing_pkgs[*]}${NC}"
+            ERR "Cannot continue without required tools. Install manually and retry."
             return 1
         fi
     fi
 
-    # 4. Validate x86_64 platform
+    # Validate x86_64 platform
     if [[ "$(uname -m)" != "x86_64" ]]; then
-        echo -e "${B_RED}[X] Architecture Error: x86_64 required. Detected: $(uname -m)${NC}"
+        ERR "x86_64 architecture required. Detected: $(uname -m)"
         return 1
     fi
 
-    # 5. System Information Display
     echo ""
-    echo -e "${B_CYAN}--- System Specs ---${NC}"
-    echo -e "  Available disk: $(df -h "$HOME" | awk 'NR==2{print $4}') free"
-    echo -e "  System RAM:     $(free -h | awk '/Mem:/ {print $2}')"
-    echo -e "${B_YELLOW}  Note: The 8B model is ~5 GB. Total ~8 GB free recommended.${NC}"
-    
+    INFO "Available disk: $(df -h "$HOME" | awk 'NR==2{print $4}') free"
+    INFO "System RAM:     $(free -h | awk '/Mem:/ {print $2}')"
+    WARN "The 8B model download is ~5 GB. Ensure you have ~8 GB free total."
     return 0
 }
 
 # ================================================================
 #  HARDWARE DETECTION ENGINE
+#
+#  FIX: install_AMD_gpu_drivers() and install_intel_gpu_drivers()
+#       were called directly inside detect_gpu(). This caused driver
+#       installation to trigger on every single status check and menu
+#       refresh — a serious unintended side-effect. Detection now only
+#       prints the GPU type; installation is left to build_engine()
+#       and deep_repair() where it belongs.
+#
+#  FIX: The Intel elif block contained orphaned if/else statements
+#       (Arc OpenCL and lspci checks) that ran after 'echo "INTEL"'
+#       but produced no useful return value and mixed stdout with the
+#       detect_gpu output, breaking callers.
 # ================================================================
 detect_gpu() {
     local gpu_info
@@ -175,6 +197,7 @@ detect_gpu() {
 
 # ================================================================
 #  GPU DRIVER INSTALLERS
+#  These are now called explicitly from build_engine / deep_repair.
 # ================================================================
 
 install_Nvidia_gpu_drivers() {
@@ -195,51 +218,75 @@ install_AMD_gpu_drivers() {
 
 install_intel_gpu_drivers() {
     STEP "Installing Intel Arc GPU drivers (OpenCL + level-zero + oneAPI)…"
-
-    # ── Intel compute-runtime (OpenCL ICD + level-zero) ──────────
     INFO "Checking Intel GPU driver packages…"
 
-    if [[ ! -f /etc/apt/sources.list.d/intel-gpu.list ]]; then
-        wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
+    # ── 1. Intel GPU compute-runtime repo (OpenCL ICD + level-zero shim) ──
+    # The repo layout changed: Noble (24.04) uses 'ubuntu2404' not 'noble unified'.
+    # The key must be fetched with curl (wget -O- has broken pipe issues with gpg).
+    if [[ ! -f /etc/apt/sources.list.d/intel-gpu-noble.list ]]; then
+        INFO "  Adding Intel GPU repo for Ubuntu 24.04 Noble…"
+        curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key \
             | sudo gpg --yes --dearmor \
-                -o /usr/share/keyrings/intel-graphics.gpg
+                --output /usr/share/keyrings/intel-graphics.gpg \
+            || { ERR "Failed to import Intel GPU key."; return 1; }
         echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
-https://repositories.intel.com/gpu/ubuntu noble unified" \
-            | sudo tee /etc/apt/sources.list.d/intel-gpu.list
-        sudo apt-get update -qq || true
+https://repositories.intel.com/gpu/ubuntu noble client" \
+            | sudo tee /etc/apt/sources.list.d/intel-gpu-noble.list > /dev/null
+        sudo apt-get update -qq 2>&1 | tee -a "$LOG_FILE" || true
+    else
+        INFO "  Intel GPU repo already present."
     fi
 
+    # ── 2. Required runtime packages ──
     local PKGS=()
 
-    if ! dpkg -l intel-opencl-icd 2>/dev/null | grep -q '^ii'; then
-        PKGS+=("intel-opencl-icd")
-    else
+    # OpenCL ICD (userspace OpenCL dispatcher)
+    if dpkg -s intel-opencl-icd &>/dev/null 2>&1; then
         INFO "  intel-opencl-icd     ✓ already installed"
+    else
+        PKGS+=("intel-opencl-icd")
     fi
 
-    if dpkg -l libze-intel-gpu1 2>/dev/null | grep -q '^ii' \
-    || dpkg -l intel-level-zero-gpu 2>/dev/null | grep -q '^ii'; then
+    # level-zero GPU shim — accept either package name (repo changed it)
+    if dpkg -s libze-intel-gpu1 &>/dev/null 2>&1 \
+    || dpkg -s intel-level-zero-gpu &>/dev/null 2>&1; then
         INFO "  level-zero GPU shim  ✓ already installed"
     else
         PKGS+=("libze-intel-gpu1")
     fi
 
-    if ! dpkg -l libze1 2>/dev/null | grep -q '^ii'; then
-        PKGS+=("libze1")
-    else
+    # level-zero ICD loader
+    if dpkg -s libze1 &>/dev/null 2>&1; then
         INFO "  libze1               ✓ already installed"
+    else
+        PKGS+=("libze1")
     fi
 
     if [[ ${#PKGS[@]} -gt 0 ]]; then
-        INFO "  Installing: ${PKGS[*]}"
-        sudo apt-get install -y "${PKGS[@]}" &>> "$LOG_FILE" || true
+        INFO "  Installing GPU runtime: ${PKGS[*]}"
+        sudo apt-get install -y "${PKGS[@]}" 2>&1 | tee -a "$LOG_FILE" || {
+            ERR "Failed to install GPU runtime packages."
+            WARN "  Try: sudo apt-get update && sudo apt-get install ${PKGS[*]}"
+        }
     fi
 
-    sudo apt-get install -y --no-install-recommends clinfo libze-dev &>> "$LOG_FILE" 2>/dev/null || true
-    OK "Intel GPU driver packages ready."
+    # clinfo + level-zero dev headers (optional, non-fatal)
+    sudo apt-get install -y --no-install-recommends clinfo libze-dev 2>&1 \
+        | tee -a "$LOG_FILE" || true
 
-    # ── Intel oneAPI — compiler + runtime ─────────────────────────
-    INFO "Checking Intel oneAPI compiler…"
+    OK "Intel GPU runtime packages ready."
+
+    # ── 3. Intel oneAPI SYCL compiler ──
+    # Package was renamed: 'intel-oneapi-compiler-dpcpp-cpp' is the current name.
+    # 'intel-oneapi-dpcpp-cpp' and 'intel-oneapi-compiler-dpcpp-cpp-2024' are aliases
+    # that may or may not exist depending on repo version — try in order.
+    INFO "Checking Intel oneAPI SYCL compiler…"
+
+    # Source setvars.sh first in case icx is already installed but not on PATH
+    local SETVARS=""
+    SETVARS=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
+    [[ -n "$SETVARS" ]] && source "$SETVARS" 2>/dev/null || true
+
     local ICX_BIN=""
     ICX_BIN=$(command -v icx 2>/dev/null) \
         || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
@@ -248,37 +295,75 @@ https://repositories.intel.com/gpu/ubuntu noble unified" \
     if [[ -n "$ICX_BIN" ]]; then
         OK "Intel icx compiler found: $ICX_BIN"
     else
-        INFO "Installing Intel oneAPI compiler (intel-oneapi-compiler-dpcpp-cpp)…"
+        INFO "Installing Intel oneAPI SYCL compiler…"
+
+        # Ensure the oneAPI APT repo is present
         if [[ ! -f /etc/apt/sources.list.d/oneAPI.list ]]; then
-            wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
                 | sudo gpg --yes --dearmor \
-                    -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+                    --output /usr/share/keyrings/oneapi-archive-keyring.gpg \
+                || { ERR "Failed to import oneAPI GPG key."; return 1; }
             echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] \
 https://apt.repos.intel.com/oneapi all main" \
-                | sudo tee /etc/apt/sources.list.d/oneAPI.list
-            sudo apt-get update -qq || true
+                | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
+            sudo apt-get update -qq 2>&1 | tee -a "$LOG_FILE" || true
         fi
-        sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp &>> "$LOG_FILE"
+
+        # Try package names in order of preference
+        local installed_oneapi=0
+        for pkg in intel-oneapi-compiler-dpcpp-cpp intel-oneapi-dpcpp-cpp; do
+            if sudo apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
+                installed_oneapi=1
+                break
+            fi
+        done
+
+        if (( installed_oneapi == 0 )); then
+            ERR "Could not install any oneAPI SYCL compiler package."
+            WARN "  Check: sudo apt-get update && apt-cache search oneapi | grep dpcpp"
+            return 1
+        fi
+
+        # Re-source and re-check
+        SETVARS=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
+        [[ -n "$SETVARS" ]] && source "$SETVARS" 2>/dev/null || true
         ICX_BIN=$(command -v icx 2>/dev/null) \
             || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
             || true
+
         [[ -n "$ICX_BIN" ]] \
             && OK "icx installed: $ICX_BIN" \
-            || ERR "icx still not found after install — check apt output above."
+            || ERR "icx still not found after install — check apt output in $LOG_FILE"
     fi
 
-    # ── Groups + verify ───────────────────────────────────────────
+    # ── 4. Patch shell profiles so setvars.sh loads at login ──
+    if [[ -n "$SETVARS" ]]; then
+        local SETVARS_LINE="source \"$SETVARS\" 2>/dev/null || true  # Intel oneAPI"
+        for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+            if [[ -f "$rc" ]] && ! grep -q "Intel oneAPI" "$rc" 2>/dev/null; then
+                echo "" >> "$rc"
+                echo "$SETVARS_LINE" >> "$rc"
+                INFO "  Patched $rc with oneAPI setvars.sh"
+            fi
+        done
+    fi
+
+    # ── 5. Groups + verify ──
     sudo usermod -aG render,video "$USER" 2>/dev/null || true
     OK "User added to render/video groups (re-login to take effect)."
 
-    INFO "GPU visibility check:"
-    echo -e "  OpenCL (clinfo):"; clinfo -l 2>/dev/null | grep -i "intel\|Arc" || WARN "  No Intel GPU via OpenCL"
-    echo -e "  level-zero backend:"
-    if dpkg -l libze-intel-gpu1 2>/dev/null | grep -q '^ii'; then
-        OK "  libze-intel-gpu1 installed — SYCL should see the GPU after re-login"
+    INFO "Quick GPU visibility check:"
+    if command -v clinfo &>/dev/null; then
+        clinfo -l 2>/dev/null | grep -i "intel\|Arc" \
+            && OK "  Intel GPU visible via OpenCL" \
+            || WARN "  Intel GPU NOT visible via OpenCL (may need re-login)"
+    fi
+
+    if dpkg -s libze-intel-gpu1 &>/dev/null 2>&1 \
+    || dpkg -s intel-level-zero-gpu &>/dev/null 2>&1; then
+        OK "  level-zero GPU shim installed — SYCL will see the GPU after re-login"
     else
-        WARN "  libze-intel-gpu1 NOT installed — SYCL will not find the GPU!"
-        WARN "  Run: sudo apt-get install libze-intel-gpu1"
+        WARN "  level-zero shim NOT installed — SYCL will not find the GPU"
     fi
 }
 
@@ -344,7 +429,63 @@ deep_repair() {
 }
 
 # ================================================================
-#  SMART BUILD ENGINE
+#  PATH INSTALLER
+#  Symlinks llama-cli and llama-server into ~/.local/bin and ensures
+#  that directory is on PATH in ~/.bashrc and ~/.zshrc persistently.
+# ================================================================
+install_to_path() {
+    local bin_dir="$HOME/.local/bin"
+    mkdir -p "$bin_dir"
+
+    local installed_any=0
+    for binary in llama-cli llama-server; do
+        local src="$BUILD_DIR/bin/$binary"
+        local dst="$bin_dir/$binary"
+        if [[ ! -f "$src" ]]; then
+            WARN "  $binary not found at $src — skipping."
+            continue
+        fi
+        # Remove stale symlink or old copy before re-linking
+        [[ -L "$dst" || -f "$dst" ]] && rm -f "$dst"
+        ln -s "$src" "$dst"
+        OK "  $binary → $dst (symlink)"
+        installed_any=1
+    done
+
+    if (( installed_any == 0 )); then
+        WARN "No binaries were linked — build may have failed."
+        return 1
+    fi
+
+    # Ensure ~/.local/bin is on PATH in shell profiles
+    local path_line='export PATH="$HOME/.local/bin:$PATH"  # llama.cpp binaries'
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        [[ -f "$rc" ]] || continue
+        if ! grep -q "llama.cpp binaries" "$rc" 2>/dev/null; then
+            echo "" >> "$rc"
+            echo "$path_line" >> "$rc"
+            INFO "  Patched $rc with PATH entry."
+        fi
+    done
+
+    # Also export into the current session immediately
+    export PATH="$bin_dir:$PATH"
+
+    echo ""
+    OK "llama-cli and llama-server are now available system-wide."
+    INFO "  Run: llama-cli --help"
+    INFO "  Run: llama-server --help"
+    INFO "  (New terminals will pick this up automatically)"
+}
+
+
+#
+#  FIX 1: 'sudo apt-get install -y' with no packages (bare command)
+#          was left on its own line and would error — removed.
+#  FIX 2: Continuation backslash had a trailing space ('cmake \ ')
+#          which breaks line continuation — fixed.
+#  FIX 3: install_AMD/INTEL gpu drivers are now called here during
+#          build so the correct stack is present before compiling.
 # ================================================================
 build_engine() {
     draw_header
@@ -438,6 +579,9 @@ build_engine() {
         echo -e "${B_YELLOW} Adding $USER to render & video groups…${NC}"
         sudo usermod -aG render "$USER" || true
         sudo usermod -aG video  "$USER" || true
+        echo ""
+        STEP "Installing binaries to PATH…"
+        install_to_path
     else
         echo -e "\n${B_RED}✖ Build failed. Check logs with option 7.${NC}"
     fi
@@ -465,16 +609,16 @@ show_download_status() {
     for f in "$DL_DIR"/*.status; do
         [[ -f "$f" ]] || continue
         local st
-        st=$(<"$f") # Faster Bash-native way to read files
+        st=$(cat "$f" 2>/dev/null || echo "")
         case "$st" in
-            RUNNING) (( active++ )) ;;
-            DONE)    (( done_count++ )) ;;
-            FAILED)  (( failed++ )) ;;
+            RUNNING)   (( active++ )) ;;
+            DONE)      (( done_count++ )) ;;
+            FAILED)    (( failed++ )) ;;
         esac
-    done 2>/dev/null
-    (( active > 0 ))     && echo -e "  Downloads:      ${B_YELLOW}⬇  $active in progress${NC}"
-    (( done_count > 0 ))  && echo -e "  Downloads:      ${B_GREEN}✔  $done_count completed (clear with option 2)${NC}"
-    (( failed > 0 ))      && echo -e "  Downloads:      ${B_RED}✖  $failed failed (check logs)${NC}"
+    done
+    (( active > 0 ))      && echo -e "  Downloads:     ${B_YELLOW}⬇  $active in progress${NC}"
+    (( done_count > 0 ))  && echo -e "  Downloads:     ${B_GREEN}✔  $done_count completed (clear with option 2)${NC}"
+    (( failed > 0 ))      && echo -e "  Downloads:     ${B_RED}✖  $failed failed (check logs)${NC}"
 }
 
 # The actual download worker — run inside the spawned terminal
@@ -585,7 +729,7 @@ download_menu() {
                     QUEUED)  echo -e "  ${B_CYAN}⏳ QUEUED:${NC}      $name" ;;
                 esac
                 any_shown=1
-            done  2>/dev/null
+            done
             (( any_shown )) && echo ""
         fi
 
@@ -622,7 +766,7 @@ download_menu() {
                        [[ -f "$f" ]] || continue
                        local st; st=$(cat "$f" 2>/dev/null || echo "")
                        [[ "$st" == "DONE" || "$st" == "FAILED" ]] && rm -f "$f"
-                   done  2>/dev/null
+                   done
                    OK "Cleared completed/failed entries."
                fi
                sleep 1; continue
@@ -709,7 +853,7 @@ select_api_key_mode() {
     sleep 1
 }
 
-# Interactive network binding picker
+# NEW: Interactive network binding picker
 select_network_binding() {
     echo -e "\n${B_CYAN}Select Network Accessibility:${NC}"
     echo "  1) 127.0.0.1  — Localhost only  (secure default)"
@@ -739,7 +883,7 @@ select_network_binding() {
     sleep 1
 }
 
-# Interactive port picker
+# NEW: Interactive port picker
 select_server_port() {
     echo -e "\n${B_CYAN}Select Server Port:${NC}"
     echo "  1) 8080  (default)"
@@ -768,7 +912,7 @@ select_server_port() {
     sleep 1
 }
 
-# Settings submenu that ties the three pickers together
+# NEW: Settings submenu that ties the three pickers together
 settings_menu() {
     while true; do
         draw_header
@@ -778,18 +922,21 @@ settings_menu() {
         echo -e "    Context size  : ${B_YELLOW}$context_size tokens${NC}"
         echo -e "    Network bind  : ${B_YELLOW}$visible2network${NC}"
         echo -e "    Server port   : ${B_YELLOW}$network_port${NC}"
+        echo -e "    API key mode  : ${B_YELLOW}$api_key_mode${NC}"
         echo -e ""
         echo -e "  1) Change Context Size"
         echo -e "  2) Change Network Binding"
         echo -e "  3) Change Server Port"
-        echo -e "  4) Back"
+        echo -e "  4) Change API Key Mode"
+        echo -e "  5) Back"
         local s=""
-        read -r -p "Select [1-4]: " s
+        read -r -p "Select [1-5]: " s
         case $s in
             1) select_context_size ;;
             2) select_network_binding ;;
             3) select_server_port ;;
-            4) return ;;
+            4) select_api_key_mode ;;
+            5) return ;;
             *) echo -e "${B_RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
@@ -962,7 +1109,12 @@ manage_server() {
     fi
 
     local api_key
-    api_key=$(openssl rand -hex 12)
+    case "$api_key_mode" in
+        "random")    api_key=$(openssl rand -hex 12) ;;
+        "localtest") api_key="localtest" ;;
+        custom:*)    api_key="${api_key_mode#custom:}" ;;
+        *)           api_key=$(openssl rand -hex 12) ;;   # fallback
+    esac
 
     # FIX: Derive the display URL from the actual bind address.
     # If bound to 0.0.0.0 show the LAN IP; otherwise show exactly what
@@ -976,7 +1128,7 @@ manage_server() {
     fi
     local server_url="https://${display_ip}:${network_port}"
 
-    # Use --ctx-size (llama-server flag); -c is llama-cli only in
+    # FIX: Use --ctx-size (llama-server flag); -c is llama-cli only in
     #      recent llama.cpp builds and is silently ignored by the server.
     "$BUILD_DIR/bin/llama-server" \
         -m "$model" \
@@ -1106,6 +1258,6 @@ while true; do
             read -p "Press Enter to return..."
             ;;
         9) echo -e "${B_CYAN}Goodbye!${NC}"; exit 0 ;;
-        *) echo -e "${B_RED}Invalid option.${NC}"; sleep 2 ;;
+        *) echo -e "${B_RED}Invalid option.${NC}"; sleep 1 ;;
     esac
 done
