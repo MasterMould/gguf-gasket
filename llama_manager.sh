@@ -296,9 +296,22 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
     # sub-scripts — no redirect can suppress this. Only source it when icx is
     # genuinely absent from the session.
     local ICX_BIN=""
-    ICX_BIN=$(command -v icx 2>/dev/null) \
-        || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
-        || true
+    ICX_BIN=$(command -v icx 2>/dev/null) || true
+    # Always verify PATH icx is the newest installed — an upgrade may leave PATH stale
+    if [[ -n "$ICX_BIN" ]]; then
+        local path_ver newest_installed
+        path_ver=$(echo "$ICX_BIN" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
+        newest_installed=$(find /opt/intel/oneapi/compiler -maxdepth 1 -mindepth 1 \
+            -type d 2>/dev/null | grep -oP '\d{4}\.\d[\d.]*' | sort -rV | head -1) || true
+        if [[ -n "$newest_installed" && "$path_ver" != "${newest_installed%%.*}" ]]; then
+            ICX_BIN=$(find /opt/intel/oneapi/compiler/"$newest_installed"/bin \
+                -name icx -type f 2>/dev/null | head -1) || true
+        fi
+    fi
+    if [[ -z "$ICX_BIN" ]]; then
+        ICX_BIN=$(find /opt/intel/oneapi/compiler -name icx -type f \
+            2>/dev/null | sort -rV | head -1) || true
+    fi
 
     if [[ -n "$ICX_BIN" ]]; then
         OK "Intel icx compiler found: $ICX_BIN"
@@ -333,8 +346,8 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
                 fi
             done
 
-            # Re-locate icx after potential upgrade
-            ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null \
+            # Re-locate icx after potential upgrade — sort -rV ensures newest wins
+            ICX_BIN=$(find /opt/intel/oneapi/compiler -name icx -type f 2>/dev/null \
                 | sort -rV | head -1) || true
             ICX_MAJOR=$(echo "$ICX_BIN" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
 
@@ -543,9 +556,9 @@ install_to_path() {
     local oneapi_lib_line=""
     local _sycl_lib _mkl_lib
     _sycl_lib=$(find /opt/intel/oneapi/compiler -name "libsycl.so" -type f 2>/dev/null \
-        | head -1 | xargs -r dirname) || true
+        | sort -rV | head -1 | xargs -r dirname) || true
     _mkl_lib=$(find /opt/intel/oneapi/mkl -maxdepth 3 -name "libmkl_core.so" -type f 2>/dev/null \
-        | head -1 | xargs -r dirname) || true
+        | sort -rV | head -1 | xargs -r dirname) || true
 
     if [[ -n "$_sycl_lib" || -n "$_mkl_lib" ]]; then
         oneapi_lib_line="export LD_LIBRARY_PATH=\"${_sycl_lib:+$_sycl_lib:}${_mkl_lib:+$_mkl_lib:}\${LD_LIBRARY_PATH:-}\"  # oneAPI runtime"
@@ -645,11 +658,28 @@ build_engine() {
             # install_intel_gpu_drivers already sourced setvars.sh in this session.
             # Do NOT source it again — setvars.sh writes to /dev/tty directly from
             # sub-scripts, bypassing all stdout/stderr redirects and polluting output.
-            # Instead, locate icx on PATH or by find, and export its directory if needed.
+            # Use find sorted by version (newest first) so an older leftover compiler
+            # installation never shadows a freshly upgraded one.
             local ICX_PATH=""
-            ICX_PATH=$(command -v icx 2>/dev/null) \
-                || ICX_PATH=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
-                || true
+            ICX_PATH=$(command -v icx 2>/dev/null) || true
+            # If PATH still points to old version, force find newest by sort -rV
+            if [[ -n "$ICX_PATH" ]]; then
+                local icx_ver
+                icx_ver=$(echo "$ICX_PATH" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
+                local newest_ver
+                newest_ver=$(find /opt/intel/oneapi/compiler -maxdepth 1 -mindepth 1 \
+                    -type d 2>/dev/null | grep -oP '\d{4}\.\d[\d.]*' | sort -rV | head -1) || true
+                # If PATH icx is older than what's installed, override with newest
+                if [[ -n "$newest_ver" && "$icx_ver" != "${newest_ver%%.*}" ]]; then
+                    ICX_PATH=$(find /opt/intel/oneapi/compiler/"$newest_ver"/bin \
+                        -name icx -type f 2>/dev/null | head -1) || true
+                fi
+            fi
+            # Fallback: find newest by sort -rV
+            if [[ -z "$ICX_PATH" ]]; then
+                ICX_PATH=$(find /opt/intel/oneapi/compiler -name icx -type f \
+                    2>/dev/null | sort -rV | head -1) || true
+            fi
 
             if [[ -n "$ICX_PATH" ]]; then
                 # Ensure the compiler's bin dir is on PATH for cmake to find it
@@ -698,19 +728,27 @@ build_engine() {
                     [[ "${mkl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
                 fi
 
-                # Ensure oneAPI runtime libs are on LD_LIBRARY_PATH so the built
-                # binaries can find libsycl.so, libmkl_*.so etc. at runtime.
-                # Also collect paths for -DCMAKE_SHARED_LINKER_FLAGS rpath injection
-                # so the linker can resolve libsycl.so at build time too.
-                local ONEAPI_LIB_DIR=""
-                ONEAPI_LIB_DIR=$(find /opt/intel/oneapi/compiler -name "libsycl.so" \
-                    -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+                # Derive the compiler lib dir directly from the resolved ICX_PATH so
+                # it always matches the compiler version being used. Never use a bare
+                # find here — it may return a different (older) compiler version dir.
+                local ICX_VERSION_DIR
+                ICX_VERSION_DIR=$(dirname "$(dirname "$ICX_PATH")")  # .../compiler/2026.0
+                local ONEAPI_LIB_DIR="$ICX_VERSION_DIR/lib"
+                # Verify libsycl.so actually exists at this derived path
+                if [[ ! -f "$ONEAPI_LIB_DIR/libsycl.so" ]]; then
+                    # Try lib64 as fallback
+                    [[ -f "$ICX_VERSION_DIR/lib64/libsycl.so" ]] \
+                        && ONEAPI_LIB_DIR="$ICX_VERSION_DIR/lib64" \
+                        || { WARN "libsycl.so not found under $ICX_VERSION_DIR"; ONEAPI_LIB_DIR=""; }
+                fi
+                echo "SYCL lib dir: $ONEAPI_LIB_DIR" | tee -a "$LOG_FILE"
+
                 local MKL_LIB_DIR=""
                 MKL_LIB_DIR=$(find /opt/intel/oneapi/mkl -maxdepth 3 -name "libmkl_core.so" \
-                    -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+                    -type f 2>/dev/null | sort -rV | head -1 | xargs -r dirname) || true
                 local TBB_LIB_DIR=""
                 TBB_LIB_DIR=$(find /opt/intel/oneapi/tbb -name "libtbb.so*" \
-                    -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+                    -type f 2>/dev/null | sort -rV | head -1 | xargs -r dirname) || true
 
                 # Tell cmake's linker where the oneAPI runtime shared libs live.
                 # CMAKE_LIBRARY_PATH is the correct mechanism — it extends the
