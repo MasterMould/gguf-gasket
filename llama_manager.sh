@@ -277,16 +277,12 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
     OK "Intel GPU runtime packages ready."
 
     # ── 3. Intel oneAPI SYCL compiler ──
-    # Package was renamed: 'intel-oneapi-compiler-dpcpp-cpp' is the current name.
-    # 'intel-oneapi-dpcpp-cpp' and 'intel-oneapi-compiler-dpcpp-cpp-2024' are aliases
-    # that may or may not exist depending on repo version — try in order.
     INFO "Checking Intel oneAPI SYCL compiler…"
 
-    # Source setvars.sh first in case icx is already installed but not on PATH
-    local SETVARS=""
-    SETVARS=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
-    [[ -n "$SETVARS" ]] && source "$SETVARS" 2>/dev/null || true
-
+    # Check for icx on PATH first before attempting any setvars sourcing.
+    # setvars.sh writes "already been run" warnings directly to /dev/tty from
+    # sub-scripts — no redirect can suppress this. Only source it when icx is
+    # genuinely absent from the session.
     local ICX_BIN=""
     ICX_BIN=$(command -v icx 2>/dev/null) \
         || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
@@ -294,51 +290,64 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
 
     if [[ -n "$ICX_BIN" ]]; then
         OK "Intel icx compiler found: $ICX_BIN"
+        # Ensure its bin dir is on PATH for sub-processes (cmake etc.)
+        export PATH="$(dirname "$ICX_BIN"):$PATH"
     else
-        INFO "Installing Intel oneAPI SYCL compiler…"
+        INFO "icx not on PATH — sourcing oneAPI setvars.sh for first-time setup…"
 
-        # Ensure the oneAPI APT repo is present
-        if [[ ! -f /etc/apt/sources.list.d/oneAPI.list ]]; then
-            curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
-                | sudo gpg --yes --dearmor \
-                    --output /usr/share/keyrings/oneapi-archive-keyring.gpg \
-                || { ERR "Failed to import oneAPI GPG key."; return 1; }
-            echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] \
-https://apt.repos.intel.com/oneapi all main" \
-                | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
-            sudo apt-get update -qq 2>&1 | tee -a "$LOG_FILE" || true
-        fi
-
-        # Try package names in order of preference
-        local installed_oneapi=0
-        for pkg in intel-oneapi-compiler-dpcpp-cpp intel-oneapi-dpcpp-cpp; do
-            if sudo apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
-                installed_oneapi=1
-                break
-            fi
-        done
-
-        if (( installed_oneapi == 0 )); then
-            ERR "Could not install any oneAPI SYCL compiler package."
-            WARN "  Check: sudo apt-get update && apt-cache search oneapi | grep dpcpp"
-            return 1
-        fi
-
-        # Re-source and re-check
+        local SETVARS=""
         SETVARS=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
-        [[ -n "$SETVARS" ]] && source "$SETVARS" 2>/dev/null || true
+
+        if [[ -z "$SETVARS" ]]; then
+            # oneAPI not installed at all — add repo and install compiler
+            INFO "Installing Intel oneAPI SYCL compiler…"
+            if [[ ! -f /etc/apt/sources.list.d/oneAPI.list ]]; then
+                curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+                    | sudo gpg --yes --dearmor \
+                        --output /usr/share/keyrings/oneapi-archive-keyring.gpg \
+                    || { ERR "Failed to import oneAPI GPG key."; return 1; }
+                echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] \
+https://apt.repos.intel.com/oneapi all main" \
+                    | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
+                sudo apt-get update -qq 2>&1 | tee -a "$LOG_FILE" || true
+            fi
+
+            # Try package names in order of preference
+            local installed_oneapi=0
+            for pkg in intel-oneapi-compiler-dpcpp-cpp intel-oneapi-dpcpp-cpp; do
+                if sudo apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
+                    installed_oneapi=1
+                    break
+                fi
+            done
+
+            if (( installed_oneapi == 0 )); then
+                ERR "Could not install any oneAPI SYCL compiler package."
+                WARN "  Check: sudo apt-get update && apt-cache search oneapi | grep dpcpp"
+                return 1
+            fi
+        fi
+
+        # Locate icx after install — use find, do NOT re-source setvars
         ICX_BIN=$(command -v icx 2>/dev/null) \
             || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
             || true
 
-        [[ -n "$ICX_BIN" ]] \
-            && OK "icx installed: $ICX_BIN" \
-            || ERR "icx still not found after install — check apt output in $LOG_FILE"
+        if [[ -n "$ICX_BIN" ]]; then
+            export PATH="$(dirname "$ICX_BIN"):$PATH"
+            OK "icx ready: $ICX_BIN"
+        else
+            ERR "icx still not found — check apt output in $LOG_FILE"
+            WARN "  Open a new terminal and run: source /opt/intel/oneapi/setvars.sh"
+        fi
     fi
 
     # ── 4. Patch shell profiles so setvars.sh loads at login ──
-    if [[ -n "$SETVARS" ]]; then
-        local SETVARS_LINE="source \"$SETVARS\" 2>/dev/null || true  # Intel oneAPI"
+    # Find setvars path — variable may not be set if icx was already on PATH above
+    local SETVARS_FOR_PROFILE=""
+    SETVARS_FOR_PROFILE=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
+    if [[ -n "$SETVARS_FOR_PROFILE" ]]; then
+        local SETVARS_LINE="source \"$SETVARS_FOR_PROFILE\" 2>/dev/null || true  # Intel oneAPI"
         for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
             if [[ -f "$rc" ]] && ! grep -q "Intel oneAPI" "$rc" 2>/dev/null; then
                 echo "" >> "$rc"
@@ -551,29 +560,26 @@ build_engine() {
             install_intel_gpu_drivers
             echo "Optimizing for Intel Arc (SYCL)..." | tee -a "$LOG_FILE"
 
-            # Locate setvars.sh dynamically — do NOT use a hardcoded path.
-            # Source with --force so a "already been run" warning doesn't make
-            # the exit code non-zero and falsely trigger the fallback branch.
-            local SETVARS_BUILD=""
-            SETVARS_BUILD=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
+            # install_intel_gpu_drivers already sourced setvars.sh in this session.
+            # Do NOT source it again — setvars.sh writes to /dev/tty directly from
+            # sub-scripts, bypassing all stdout/stderr redirects and polluting output.
+            # Instead, locate icx on PATH or by find, and export its directory if needed.
+            local ICX_PATH=""
+            ICX_PATH=$(command -v icx 2>/dev/null) \
+                || ICX_PATH=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
+                || true
 
-            local sycl_ready=0
-            if [[ -n "$SETVARS_BUILD" ]]; then
-                # Suppress the "already run" warning — it prints to stdout and
-                # pollutes the log; redirect to /dev/null, only keep errors.
-                source "$SETVARS_BUILD" --force > /dev/null 2>&1 || true
-                # Trust icx presence, not the source exit code
-                if command -v icx &>/dev/null \
-                || find /opt/intel/oneapi -name icx -type f 2>/dev/null | grep -q .; then
-                    echo "OneAPI environment loaded (icx confirmed)." | tee -a "$LOG_FILE"
-                    cmake_flags+=("-DGGML_SYCL=ON")
-                    sycl_ready=1
-                fi
-            fi
-
-            if (( sycl_ready == 0 )); then
-                echo -e "${B_RED}[!] icx compiler not found after sourcing setvars.sh.${NC}" | tee -a "$LOG_FILE"
-                echo -e "${B_YELLOW}    Try: source /opt/intel/oneapi/setvars.sh --force${NC}"
+            if [[ -n "$ICX_PATH" ]]; then
+                # Ensure the compiler's bin dir is on PATH for cmake to find it
+                local icx_bin_dir
+                icx_bin_dir=$(dirname "$ICX_PATH")
+                export PATH="$icx_bin_dir:$PATH"
+                echo "OneAPI icx confirmed: $ICX_PATH" | tee -a "$LOG_FILE"
+                cmake_flags+=("-DGGML_SYCL=ON")
+            else
+                echo -e "${B_RED}[!] icx compiler not found. SYCL build will fail.${NC}" | tee -a "$LOG_FILE"
+                echo -e "${B_YELLOW}    Run: source /opt/intel/oneapi/setvars.sh --force${NC}"
+                echo -e "${B_YELLOW}    Then re-run Build AI Engine.${NC}"
                 read -rp "Continue anyway with CPU fallback? (y/n): " sycl_fallback
                 [[ "${sycl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
             fi
