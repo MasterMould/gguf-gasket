@@ -492,6 +492,31 @@ install_to_path() {
     # Also export into the current session immediately
     export PATH="$bin_dir:$PATH"
 
+    # For Intel SYCL builds, also persist oneAPI runtime library paths so
+    # llama-server / llama-cli can find libsycl.so and libmkl_*.so when run
+    # directly from the terminal without the script having set LD_LIBRARY_PATH.
+    local oneapi_lib_line=""
+    local _sycl_lib _mkl_lib
+    _sycl_lib=$(find /opt/intel/oneapi/compiler -name "libsycl.so" -type f 2>/dev/null \
+        | head -1 | xargs -r dirname) || true
+    _mkl_lib=$(find /opt/intel/oneapi/mkl -maxdepth 3 -name "libmkl_core.so" -type f 2>/dev/null \
+        | head -1 | xargs -r dirname) || true
+
+    if [[ -n "$_sycl_lib" || -n "$_mkl_lib" ]]; then
+        oneapi_lib_line="export LD_LIBRARY_PATH=\"${_sycl_lib:+$_sycl_lib:}${_mkl_lib:+$_mkl_lib:}\${LD_LIBRARY_PATH:-}\"  # oneAPI runtime"
+        for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+            [[ -f "$rc" ]] || continue
+            if ! grep -q "oneAPI runtime" "$rc" 2>/dev/null; then
+                echo "" >> "$rc"
+                echo "$oneapi_lib_line" >> "$rc"
+                INFO "  Patched $rc with oneAPI LD_LIBRARY_PATH."
+            fi
+        done
+        # Apply to current session immediately
+        [[ -n "$_sycl_lib" ]] && export LD_LIBRARY_PATH="$_sycl_lib:${LD_LIBRARY_PATH:-}"
+        [[ -n "$_mkl_lib"  ]] && export LD_LIBRARY_PATH="$_mkl_lib:${LD_LIBRARY_PATH:-}"
+    fi
+
     echo ""
     OK "llama-cli and llama-server are now available system-wide."
     INFO "  Run: llama-cli --help"
@@ -587,7 +612,26 @@ build_engine() {
                 icx_bin_dir=$(dirname "$ICX_PATH")
                 export PATH="$icx_bin_dir:$PATH"
                 echo "OneAPI icx confirmed: $ICX_PATH" | tee -a "$LOG_FILE"
-                cmake_flags+=("-DGGML_SYCL=ON")
+
+                # CRITICAL: icpx (the SYCL-capable C++ compiler) must be set as
+                # CMAKE_CXX_COMPILER explicitly. Without this cmake picks up the
+                # system c++ (GCC), which doesn't know -fsycl and fails to compile
+                # every SYCL source file with "unrecognized command-line option".
+                local ICPX_PATH="$icx_bin_dir/icpx"
+                if [[ ! -f "$ICPX_PATH" ]]; then
+                    ICPX_PATH=$(find /opt/intel/oneapi -name icpx -type f 2>/dev/null | head -1) || true
+                fi
+
+                if [[ -z "$ICPX_PATH" ]]; then
+                    ERR "icpx not found alongside icx — oneAPI compiler install may be incomplete."
+                    read -rp "Continue anyway with CPU fallback? (y/n): " sycl_fallback
+                    [[ "${sycl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
+                else
+                    echo "icpx confirmed: $ICPX_PATH" | tee -a "$LOG_FILE"
+                    cmake_flags+=("-DGGML_SYCL=ON")
+                    cmake_flags+=("-DCMAKE_CXX_COMPILER=$ICPX_PATH")
+                    cmake_flags+=("-DCMAKE_C_COMPILER=$ICX_PATH")
+                fi
 
                 # Locate MKL cmake config — llama.cpp SYCL requires find_package(MKL).
                 # MKLConfig.cmake lives under the oneAPI MKL lib/cmake/mkl directory.
@@ -608,6 +652,17 @@ build_engine() {
                     read -rp "Continue anyway? cmake will likely fail. (y/n): " mkl_fallback
                     [[ "${mkl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
                 fi
+
+                # Ensure oneAPI runtime libs are on LD_LIBRARY_PATH so the built
+                # binaries can find libsycl.so, libmkl_*.so etc. at runtime.
+                local ONEAPI_LIB_DIR=""
+                ONEAPI_LIB_DIR=$(find /opt/intel/oneapi/compiler -name "libsycl.so" \
+                    -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+                local MKL_LIB_DIR=""
+                MKL_LIB_DIR=$(find /opt/intel/oneapi/mkl -maxdepth 3 -name "libmkl_core.so" \
+                    -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+                [[ -n "$ONEAPI_LIB_DIR" ]] && export LD_LIBRARY_PATH="$ONEAPI_LIB_DIR:${LD_LIBRARY_PATH:-}"
+                [[ -n "$MKL_LIB_DIR"    ]] && export LD_LIBRARY_PATH="$MKL_LIB_DIR:${LD_LIBRARY_PATH:-}"
             else
                 echo -e "${B_RED}[!] icx compiler not found. SYCL build will fail.${NC}" | tee -a "$LOG_FILE"
                 echo -e "${B_YELLOW}    Run: source /opt/intel/oneapi/setvars.sh --force${NC}"
