@@ -302,6 +302,51 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
 
     if [[ -n "$ICX_BIN" ]]; then
         OK "Intel icx compiler found: $ICX_BIN"
+
+        # ── ABI VERSION SYNC CHECK ──────────────────────────────────────────
+        # MKL and the SYCL compiler (icx/icpx) must come from the same oneAPI
+        # generation. MKL 2026 ships libmkl_sycl_blas.so.6 linked against
+        # libsycl.so.9 (oneAPI 2026 compiler). If icx is 2025.x, libsycl.so.9
+        # does not exist → "undefined reference to sycl::_V1::*" at link time.
+        # Solution: upgrade icx/icpx to match the installed MKL major version.
+        local MKL_MAJOR=""
+        MKL_MAJOR=$(find /opt/intel/oneapi/mkl -maxdepth 1 -mindepth 1 -type d \
+            2>/dev/null | grep -oP '\d{4}' | sort -rn | head -1) || true
+
+        local ICX_MAJOR=""
+        ICX_MAJOR=$(echo "$ICX_BIN" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
+
+        if [[ -n "$MKL_MAJOR" && -n "$ICX_MAJOR" && "$MKL_MAJOR" != "$ICX_MAJOR" ]]; then
+            WARN "Version mismatch: MKL ${MKL_MAJOR} vs compiler ${ICX_MAJOR}."
+            WARN "  MKL requires libsycl.so from oneAPI ${MKL_MAJOR} compiler."
+            WARN "  Upgrading intel-oneapi-compiler-dpcpp-cpp to match…"
+            sudo apt-get update -qq &>> "$LOG_FILE" || true
+            local upgraded=0
+            for pkg in intel-oneapi-compiler-dpcpp-cpp intel-oneapi-dpcpp-cpp; do
+                if sudo apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE" | grep -q "upgraded\|newly installed"; then
+                    upgraded=1; break
+                fi
+                # apt-get returns 0 even when nothing changed; check dpkg explicitly
+                if dpkg -s "$pkg" &>/dev/null 2>&1; then
+                    sudo apt-get install --only-upgrade -y "$pkg" 2>&1 | tee -a "$LOG_FILE" || true
+                    upgraded=1; break
+                fi
+            done
+
+            # Re-locate icx after potential upgrade
+            ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null \
+                | sort -rV | head -1) || true
+            ICX_MAJOR=$(echo "$ICX_BIN" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
+
+            if [[ "$MKL_MAJOR" == "$ICX_MAJOR" ]]; then
+                OK "Compiler upgraded to match MKL ${MKL_MAJOR}."
+            else
+                WARN "Compiler still at ${ICX_MAJOR} — apt may not have a ${MKL_MAJOR} package yet."
+                WARN "  The build may fail with linker errors."
+                WARN "  Alternatively: sudo apt-get install intel-oneapi-mkl-devel=2025.* to downgrade MKL."
+            fi
+        fi
+
         # Ensure its bin dir is on PATH for sub-processes (cmake etc.)
         export PATH="$(dirname "$ICX_BIN"):$PATH"
     else
@@ -667,19 +712,27 @@ build_engine() {
                 TBB_LIB_DIR=$(find /opt/intel/oneapi/tbb -name "libtbb.so*" \
                     -type f 2>/dev/null | head -1 | xargs -r dirname) || true
 
-                # FIX: MKL 2026 links against libsycl.so.9 (oneAPI 2026 compiler)
-                # but the installed compiler 2025.3 ships libsycl.so.7.
-                # Inject -rpath for the compiler lib dir so the linker finds the
-                # correct versioned libsycl.so at link time without version errors.
-                # Also add the oneAPI-bundled dnnl (not the Ubuntu system libdnnl
-                # which has no SYCL interop) to resolve dnnl_sycl_interop_* symbols.
-                local RPATH_FLAGS=""
-                [[ -n "$ONEAPI_LIB_DIR" ]] && RPATH_FLAGS+="-Wl,-rpath,$ONEAPI_LIB_DIR "
-                [[ -n "$MKL_LIB_DIR"    ]] && RPATH_FLAGS+="-Wl,-rpath,$MKL_LIB_DIR "
-                [[ -n "$TBB_LIB_DIR"    ]] && RPATH_FLAGS+="-Wl,-rpath,$TBB_LIB_DIR "
-                if [[ -n "$RPATH_FLAGS" ]]; then
-                    cmake_flags+=("-DCMAKE_SHARED_LINKER_FLAGS=$RPATH_FLAGS")
-                    cmake_flags+=("-DCMAKE_EXE_LINKER_FLAGS=$RPATH_FLAGS")
+                # Tell cmake's linker where the oneAPI runtime shared libs live.
+                # CMAKE_LIBRARY_PATH is the correct mechanism — it extends the
+                # linker search path so libsycl.so, libmkl_*.so, libtbb.so are
+                # found without needing setvars or manual -rpath injection.
+                local oneapi_lib_paths=""
+                [[ -n "$ONEAPI_LIB_DIR" ]] && oneapi_lib_paths+="$ONEAPI_LIB_DIR;"
+                [[ -n "$MKL_LIB_DIR"    ]] && oneapi_lib_paths+="$MKL_LIB_DIR;"
+                [[ -n "$TBB_LIB_DIR"    ]] && oneapi_lib_paths+="$TBB_LIB_DIR;"
+                if [[ -n "$oneapi_lib_paths" ]]; then
+                    cmake_flags+=("-DCMAKE_LIBRARY_PATH=${oneapi_lib_paths%;}")
+                fi
+
+                # Also bake rpaths into the binaries for runtime (no need to set
+                # LD_LIBRARY_PATH manually when running llama-server from a terminal).
+                local rpath_flags=""
+                [[ -n "$ONEAPI_LIB_DIR" ]] && rpath_flags+="-Wl,-rpath,$ONEAPI_LIB_DIR "
+                [[ -n "$MKL_LIB_DIR"    ]] && rpath_flags+="-Wl,-rpath,$MKL_LIB_DIR "
+                [[ -n "$TBB_LIB_DIR"    ]] && rpath_flags+="-Wl,-rpath,$TBB_LIB_DIR "
+                if [[ -n "$rpath_flags" ]]; then
+                    cmake_flags+=("-DCMAKE_SHARED_LINKER_FLAGS=${rpath_flags% }")
+                    cmake_flags+=("-DCMAKE_EXE_LINKER_FLAGS=${rpath_flags% }")
                 fi
 
                 # Locate oneAPI-bundled oneDNN (has SYCL interop symbols).
@@ -1345,78 +1398,82 @@ manage_server() {
 #  Checks the current branch against its upstream remote and shows
 #  a summary of new commits. Optionally pulls and rebuilds.
 # ================================================================
+# ================================================================
+#  SCRIPT UPDATE CHECKER
+#  Compares llama_manager.sh against the version in the GitHub repo
+#  and offers to pull the latest copy in-place.
+# ================================================================
 check_for_updates() {
     draw_header
-    echo -e "${B_CYAN}[ 🔄  LLAMA.CPP UPDATE CHECK ]${NC}"
+    echo -e "${B_CYAN}[ 🔄  LLAMA MANAGER UPDATE CHECK ]${NC}"
     echo ""
 
-    if [[ ! -d "$INSTALL_DIR/.git" ]]; then
-        WARN "llama.cpp not cloned yet — run Build AI Engine first."
+    local REPO_RAW="https://raw.githubusercontent.com/MasterMould/gguf-gasket/main/llama_manager.sh"
+    local SCRIPT_PATH
+    SCRIPT_PATH="$(realpath "$0")" || SCRIPT_PATH="$0"
+
+    echo -e "  Checking ${B_CYAN}${REPO_RAW}${NC}…"
+    echo ""
+
+    local remote_content
+    if ! remote_content=$(curl -fsSL "$REPO_RAW" 2>/dev/null); then
+        ERR "Could not reach GitHub. Check your network connection."
         read -p "Press Enter to return..."
         return
     fi
 
-    cd "$INSTALL_DIR" || return
+    # Extract version strings from local and remote scripts
+    local local_ver remote_ver
+    local_ver=$(grep -m1 'LLAMA COMMAND CENTER' "$SCRIPT_PATH" 2>/dev/null \
+        | grep -oP 'v[\d.]+' | head -1 || echo "unknown")
+    remote_ver=$(echo "$remote_content" \
+        | grep -m1 'LLAMA COMMAND CENTER' \
+        | grep -oP 'v[\d.]+' | head -1 || echo "unknown")
 
-    # Fetch from remote quietly
-    echo -e "  Fetching from origin…"
-    if ! git fetch origin 2>&1 | tee -a "$LOG_FILE"; then
-        ERR "git fetch failed — check network or $LOG_FILE."
-        read -p "Press Enter to return..."
-        return
-    fi
-
-    local branch
-    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-    local local_hash remote_hash
-    local_hash=$(git rev-parse HEAD 2>/dev/null || echo "")
-    remote_hash=$(git rev-parse "origin/$branch" 2>/dev/null || echo "")
-
-    echo ""
-    echo -e "  Branch : ${B_CYAN}$branch${NC}"
-    echo -e "  Local  : ${B_YELLOW}${local_hash:0:12}${NC}"
-    echo -e "  Remote : ${B_YELLOW}${remote_hash:0:12}${NC}"
+    echo -e "  Installed : ${B_YELLOW}${local_ver}${NC}"
+    echo -e "  Available : ${B_YELLOW}${remote_ver}${NC}"
     echo ""
 
-    if [[ "$local_hash" == "$remote_hash" ]]; then
-        OK "Already up to date — no new commits on $branch."
+    # Quick diff — count changed lines
+    local changed_lines
+    changed_lines=$(diff <(cat "$SCRIPT_PATH") <(echo "$remote_content") \
+        | grep -c '^[<>]' 2>/dev/null || echo 0)
+
+    if (( changed_lines == 0 )); then
+        OK "Script is identical to the repository — no update needed."
         echo ""
         read -p "Press Enter to return..."
         return
     fi
 
-    # Show incoming commits
-    local commit_count
-    commit_count=$(git log --oneline HEAD.."origin/$branch" 2>/dev/null | wc -l || echo 0)
-    echo -e "  ${B_GREEN}$commit_count new commit(s) available:${NC}"
-    echo ""
-    git log --oneline --color=always HEAD.."origin/$branch" 2>/dev/null | head -20
-    local total
-    total=$(git log --oneline HEAD.."origin/$branch" 2>/dev/null | wc -l || echo 0)
-    (( total > 20 )) && echo -e "  … and $(( total - 20 )) more."
+    echo -e "  ${B_GREEN}Update available — ${changed_lines} line(s) differ from GitHub.${NC}"
     echo ""
 
-    read -rp "  Pull updates now? (y/n): " do_pull
-    if [[ "${do_pull,,}" != "y" ]]; then
-        echo "  Skipped. Run Build AI Engine to apply updates when ready."
-        sleep 2; return
+    # Show a compact diff summary (first 30 changed lines)
+    diff --unified=0 <(cat "$SCRIPT_PATH") <(echo "$remote_content") 2>/dev/null \
+        | grep -E '^[+-]' | grep -v '^[+-]{3}' | head -30 \
+        | sed 's/^+/  + /; s/^-/  - /'
+    echo ""
+
+    read -rp "  Update llama_manager.sh to the latest version? (y/n): " do_update
+    if [[ "${do_update,,}" != "y" ]]; then
+        echo "  Skipped."
+        sleep 1; return
     fi
 
-    echo ""
-    echo -e "  Pulling $branch…"
-    if git pull origin "$branch" 2>&1 | tee -a "$LOG_FILE"; then
-        OK "Pull complete."
-        echo ""
-        read -rp "  Rebuild AI Engine now to apply changes? (y/n): " do_rebuild
-        if [[ "${do_rebuild,,}" == "y" ]]; then
-            build_engine
-            return
-        fi
-    else
-        ERR "git pull failed — check $LOG_FILE."
-    fi
+    # Backup current script before overwriting
+    local backup="${SCRIPT_PATH}.bak.$(date +%Y%m%d_%H%M%S)"
+    cp "$SCRIPT_PATH" "$backup" || { ERR "Could not create backup at $backup."; return 1; }
+    OK "Backup saved: $backup"
 
-    read -p "Press Enter to return..."
+    # Write new version
+    echo "$remote_content" > "$SCRIPT_PATH" \
+        && chmod +x "$SCRIPT_PATH" \
+        || { ERR "Failed to write update — restoring backup."; cp "$backup" "$SCRIPT_PATH"; return 1; }
+
+    OK "Update applied. Restarting script…"
+    sleep 1
+    exec "$SCRIPT_PATH"
 }
 
 
