@@ -602,14 +602,31 @@ build_engine() {
     current_gpu=$(detect_gpu)
     echo -e "${B_CYAN}Building AI Engine for $current_gpu...${NC}"
 
-    # Base Dependencies
+    # Base Dependencies — libdnnl-dev excluded for Intel: system libdnnl has no
+    # SYCL interop symbols (dnnl_sycl_interop_*) and cmake finds it regardless
+    # of cmake flags, causing linker failures. Intel SYCL builds use oneAPI dnnl.
+    local base_pkgs=(
+        pkg-config ca-certificates unzip file libfuse2
+        libwebkit2gtk-4.1-dev libgtk-3-dev gpg-agent
+        software-properties-common ocl-icd-libopencl1
+        build-essential git curl cmake
+        libcurl4-openssl-dev libssl-dev
+    )
+    if [[ "$current_gpu" != "INTEL" ]]; then
+        base_pkgs+=(libdnnl-dev)
+    fi
+
     sudo apt-get update -qq
-    sudo apt-get install -y --no-install-recommends \
-        pkg-config ca-certificates unzip file libfuse2 \
-        libwebkit2gtk-4.1-dev libgtk-3-dev gpg-agent \
-        software-properties-common ocl-icd-libopencl1 \
-        build-essential git curl cmake \
-        libdnnl-dev libcurl4-openssl-dev libssl-dev &>> "$LOG_FILE" || true
+    sudo apt-get install -y --no-install-recommends "${base_pkgs[@]}" &>> "$LOG_FILE" || true
+
+    # For Intel: remove system libdnnl if previously installed so cmake cannot
+    # find it. The oneAPI-bundled dnnl provides SYCL interop; the Ubuntu one does not.
+    if [[ "$current_gpu" == "INTEL" ]]; then
+        if dpkg -s libdnnl-dev &>/dev/null 2>&1; then
+            INFO "Removing system libdnnl-dev (incompatible with SYCL — using oneAPI dnnl)…"
+            sudo apt-get remove -y libdnnl-dev &>> "$LOG_FILE" || true
+        fi
+    fi
 
     OK "System packages installed."
 
@@ -784,10 +801,12 @@ build_engine() {
                     cmake_flags+=("-Ddnnl_DIR=$DNNL_CMAKE_DIR")
                     echo "oneAPI dnnl dir: $DNNL_CMAKE_DIR" | tee -a "$LOG_FILE"
                 else
-                    # If oneAPI dnnl cmake config not found, disable oneDNN in the build
-                    # to avoid linking against the incompatible system libdnnl.
-                    cmake_flags+=("-DGGML_DNNL=OFF")
-                    WARN "oneAPI dnnl not found — building without oneDNN (DNNL disabled)."
+                    # Prevent cmake from finding and linking the system libdnnl which
+                    # lacks SYCL interop. CMAKE_DISABLE_FIND_PACKAGE_DNNL is the correct
+                    # cmake mechanism — it makes find_package(DNNL) always fail cleanly.
+                    cmake_flags+=("-DCMAKE_DISABLE_FIND_PACKAGE_DNNL=ON")
+                    cmake_flags+=("-DCMAKE_DISABLE_FIND_PACKAGE_oneDNN=ON")
+                    WARN "oneAPI dnnl not found — disabling oneDNN (DNNL/oneDNN find suppressed)."
                 fi
 
                 [[ -n "$ONEAPI_LIB_DIR" ]] && export LD_LIBRARY_PATH="$ONEAPI_LIB_DIR:${LD_LIBRARY_PATH:-}"
