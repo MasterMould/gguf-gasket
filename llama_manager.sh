@@ -655,14 +655,53 @@ build_engine() {
 
                 # Ensure oneAPI runtime libs are on LD_LIBRARY_PATH so the built
                 # binaries can find libsycl.so, libmkl_*.so etc. at runtime.
+                # Also collect paths for -DCMAKE_SHARED_LINKER_FLAGS rpath injection
+                # so the linker can resolve libsycl.so at build time too.
                 local ONEAPI_LIB_DIR=""
                 ONEAPI_LIB_DIR=$(find /opt/intel/oneapi/compiler -name "libsycl.so" \
                     -type f 2>/dev/null | head -1 | xargs -r dirname) || true
                 local MKL_LIB_DIR=""
                 MKL_LIB_DIR=$(find /opt/intel/oneapi/mkl -maxdepth 3 -name "libmkl_core.so" \
                     -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+                local TBB_LIB_DIR=""
+                TBB_LIB_DIR=$(find /opt/intel/oneapi/tbb -name "libtbb.so*" \
+                    -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+
+                # FIX: MKL 2026 links against libsycl.so.9 (oneAPI 2026 compiler)
+                # but the installed compiler 2025.3 ships libsycl.so.7.
+                # Inject -rpath for the compiler lib dir so the linker finds the
+                # correct versioned libsycl.so at link time without version errors.
+                # Also add the oneAPI-bundled dnnl (not the Ubuntu system libdnnl
+                # which has no SYCL interop) to resolve dnnl_sycl_interop_* symbols.
+                local RPATH_FLAGS=""
+                [[ -n "$ONEAPI_LIB_DIR" ]] && RPATH_FLAGS+="-Wl,-rpath,$ONEAPI_LIB_DIR "
+                [[ -n "$MKL_LIB_DIR"    ]] && RPATH_FLAGS+="-Wl,-rpath,$MKL_LIB_DIR "
+                [[ -n "$TBB_LIB_DIR"    ]] && RPATH_FLAGS+="-Wl,-rpath,$TBB_LIB_DIR "
+                if [[ -n "$RPATH_FLAGS" ]]; then
+                    cmake_flags+=("-DCMAKE_SHARED_LINKER_FLAGS=$RPATH_FLAGS")
+                    cmake_flags+=("-DCMAKE_EXE_LINKER_FLAGS=$RPATH_FLAGS")
+                fi
+
+                # Locate oneAPI-bundled oneDNN (has SYCL interop symbols).
+                # The Ubuntu system libdnnl (libdnnl-dev) is SYCL-unaware and will
+                # produce "undefined reference to dnnl_sycl_interop_*" at link time.
+                local DNNL_CMAKE_DIR=""
+                DNNL_CMAKE_DIR=$(find /opt/intel/oneapi -name "dnnlConfig.cmake" \
+                    -o -name "oneapi-dnnl-config.cmake" -o -name "dnnl-config.cmake" \
+                    2>/dev/null | head -1 | xargs -r dirname) || true
+                if [[ -n "$DNNL_CMAKE_DIR" ]]; then
+                    cmake_flags+=("-Ddnnl_DIR=$DNNL_CMAKE_DIR")
+                    echo "oneAPI dnnl dir: $DNNL_CMAKE_DIR" | tee -a "$LOG_FILE"
+                else
+                    # If oneAPI dnnl cmake config not found, disable oneDNN in the build
+                    # to avoid linking against the incompatible system libdnnl.
+                    cmake_flags+=("-DGGML_DNNL=OFF")
+                    WARN "oneAPI dnnl not found — building without oneDNN (DNNL disabled)."
+                fi
+
                 [[ -n "$ONEAPI_LIB_DIR" ]] && export LD_LIBRARY_PATH="$ONEAPI_LIB_DIR:${LD_LIBRARY_PATH:-}"
                 [[ -n "$MKL_LIB_DIR"    ]] && export LD_LIBRARY_PATH="$MKL_LIB_DIR:${LD_LIBRARY_PATH:-}"
+                [[ -n "$TBB_LIB_DIR"    ]] && export LD_LIBRARY_PATH="$TBB_LIB_DIR:${LD_LIBRARY_PATH:-}"
             else
                 echo -e "${B_RED}[!] icx compiler not found. SYCL build will fail.${NC}" | tee -a "$LOG_FILE"
                 echo -e "${B_YELLOW}    Run: source /opt/intel/oneapi/setvars.sh --force${NC}"
@@ -1302,8 +1341,85 @@ manage_server() {
 }
 
 # ================================================================
-#  MAIN LOOP
+#  LLAMA.CPP UPDATE CHECKER
+#  Checks the current branch against its upstream remote and shows
+#  a summary of new commits. Optionally pulls and rebuilds.
 # ================================================================
+check_for_updates() {
+    draw_header
+    echo -e "${B_CYAN}[ 🔄  LLAMA.CPP UPDATE CHECK ]${NC}"
+    echo ""
+
+    if [[ ! -d "$INSTALL_DIR/.git" ]]; then
+        WARN "llama.cpp not cloned yet — run Build AI Engine first."
+        read -p "Press Enter to return..."
+        return
+    fi
+
+    cd "$INSTALL_DIR" || return
+
+    # Fetch from remote quietly
+    echo -e "  Fetching from origin…"
+    if ! git fetch origin 2>&1 | tee -a "$LOG_FILE"; then
+        ERR "git fetch failed — check network or $LOG_FILE."
+        read -p "Press Enter to return..."
+        return
+    fi
+
+    local branch
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    local local_hash remote_hash
+    local_hash=$(git rev-parse HEAD 2>/dev/null || echo "")
+    remote_hash=$(git rev-parse "origin/$branch" 2>/dev/null || echo "")
+
+    echo ""
+    echo -e "  Branch : ${B_CYAN}$branch${NC}"
+    echo -e "  Local  : ${B_YELLOW}${local_hash:0:12}${NC}"
+    echo -e "  Remote : ${B_YELLOW}${remote_hash:0:12}${NC}"
+    echo ""
+
+    if [[ "$local_hash" == "$remote_hash" ]]; then
+        OK "Already up to date — no new commits on $branch."
+        echo ""
+        read -p "Press Enter to return..."
+        return
+    fi
+
+    # Show incoming commits
+    local commit_count
+    commit_count=$(git log --oneline HEAD.."origin/$branch" 2>/dev/null | wc -l || echo 0)
+    echo -e "  ${B_GREEN}$commit_count new commit(s) available:${NC}"
+    echo ""
+    git log --oneline --color=always HEAD.."origin/$branch" 2>/dev/null | head -20
+    local total
+    total=$(git log --oneline HEAD.."origin/$branch" 2>/dev/null | wc -l || echo 0)
+    (( total > 20 )) && echo -e "  … and $(( total - 20 )) more."
+    echo ""
+
+    read -rp "  Pull updates now? (y/n): " do_pull
+    if [[ "${do_pull,,}" != "y" ]]; then
+        echo "  Skipped. Run Build AI Engine to apply updates when ready."
+        sleep 2; return
+    fi
+
+    echo ""
+    echo -e "  Pulling $branch…"
+    if git pull origin "$branch" 2>&1 | tee -a "$LOG_FILE"; then
+        OK "Pull complete."
+        echo ""
+        read -rp "  Rebuild AI Engine now to apply changes? (y/n): " do_rebuild
+        if [[ "${do_rebuild,,}" == "y" ]]; then
+            build_engine
+            return
+        fi
+    else
+        ERR "git pull failed — check $LOG_FILE."
+    fi
+
+    read -p "Press Enter to return..."
+}
+
+
 rotate_log
 
 while true; do
@@ -1346,9 +1462,10 @@ while true; do
     echo -e "4) ${B_GREEN}Start / Stop Web Server${NC}"
     echo -e "5) ${B_YELLOW}⚙  Settings${NC}          (Context, Port, Network)"
     echo -e "6) ${B_RED}DEEP REPAIR${NC}         (Fix Drivers/Conflicts)"
-    echo -e "7) View Forensic Logs"
-    echo -e "8) View Saved API Keys"
-    echo -e "9) Exit"
+    echo -e "7) 🔄 Check for llama.cpp Updates"
+    echo -e "8) View Forensic Logs"
+    echo -e "9) View Saved API Keys"
+    echo -e "0) Exit"
     read -p "Action: " choice
 
     case $choice in
@@ -1358,19 +1475,20 @@ while true; do
         4) manage_server ;;
         5) settings_menu ;;
         6) deep_repair ;;
-        7)
+        7) check_for_updates ;;
+        8)
             draw_header
             echo -e "${B_CYAN}--- Last 50 lines of $LOG_FILE ---${NC}"
             tail -n 50 "$LOG_FILE" 2>/dev/null || echo "(Log file is empty or missing)"
             read -p "Press Enter to return..."
             ;;
-        8)
+        9)
             draw_header
             echo -e "${B_CYAN}--- Saved API Keys ($KEY_FILE) ---${NC}"
             cat "$KEY_FILE" 2>/dev/null || echo "(No keys saved yet)"
             read -p "Press Enter to return..."
             ;;
-        9) echo -e "${B_CYAN}Goodbye!${NC}"; exit 0 ;;
+        0) echo -e "${B_CYAN}Goodbye!${NC}"; exit 0 ;;
         *) echo -e "${B_RED}Invalid option.${NC}"; sleep 1 ;;
     esac
 done
