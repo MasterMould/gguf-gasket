@@ -274,6 +274,18 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
     sudo apt-get install -y --no-install-recommends clinfo libze-dev 2>&1 \
         | tee -a "$LOG_FILE" || true
 
+    # MKL (Math Kernel Library) — required by llama.cpp SYCL backend cmake
+    # Without MKL the cmake step fails with "Could not find package MKL"
+    if dpkg -s intel-oneapi-mkl-devel &>/dev/null 2>&1; then
+        INFO "  intel-oneapi-mkl-devel ✓ already installed"
+    else
+        INFO "  Installing intel-oneapi-mkl-devel (required for SYCL cmake)…"
+        sudo apt-get install -y intel-oneapi-mkl-devel 2>&1 | tee -a "$LOG_FILE" || {
+            ERR "Failed to install intel-oneapi-mkl-devel."
+            WARN "  Run manually: sudo apt-get install intel-oneapi-mkl-devel"
+        }
+    fi
+
     OK "Intel GPU runtime packages ready."
 
     # ── 3. Intel oneAPI SYCL compiler ──
@@ -576,6 +588,26 @@ build_engine() {
                 export PATH="$icx_bin_dir:$PATH"
                 echo "OneAPI icx confirmed: $ICX_PATH" | tee -a "$LOG_FILE"
                 cmake_flags+=("-DGGML_SYCL=ON")
+
+                # Locate MKL cmake config — llama.cpp SYCL requires find_package(MKL).
+                # MKLConfig.cmake lives under the oneAPI MKL lib/cmake/mkl directory.
+                # Pass both MKL_DIR and CMAKE_PREFIX_PATH so cmake finds it regardless
+                # of whether the oneAPI environment is fully activated.
+                local MKL_CMAKE_DIR=""
+                MKL_CMAKE_DIR=$(find /opt/intel/oneapi/mkl -name "MKLConfig.cmake" \
+                    -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+
+                if [[ -n "$MKL_CMAKE_DIR" ]]; then
+                    cmake_flags+=("-DMKL_DIR=$MKL_CMAKE_DIR")
+                    cmake_flags+=("-DCMAKE_PREFIX_PATH=/opt/intel/oneapi/mkl/latest")
+                    echo "MKL cmake dir: $MKL_CMAKE_DIR" | tee -a "$LOG_FILE"
+                else
+                    WARN "MKLConfig.cmake not found — intel-oneapi-mkl-devel may not be installed."
+                    WARN "  Run: sudo apt-get install intel-oneapi-mkl-devel"
+                    WARN "  Then re-run Build AI Engine."
+                    read -rp "Continue anyway? cmake will likely fail. (y/n): " mkl_fallback
+                    [[ "${mkl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
+                fi
             else
                 echo -e "${B_RED}[!] icx compiler not found. SYCL build will fail.${NC}" | tee -a "$LOG_FILE"
                 echo -e "${B_YELLOW}    Run: source /opt/intel/oneapi/setvars.sh --force${NC}"
