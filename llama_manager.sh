@@ -550,13 +550,32 @@ build_engine() {
         "INTEL")
             install_intel_gpu_drivers
             echo "Optimizing for Intel Arc (SYCL)..." | tee -a "$LOG_FILE"
-            if source /opt/intel/oneapi/setvars.sh 2>/dev/null; then
-                echo "OneAPI environment loaded." | tee -a "$LOG_FILE"
-                cmake_flags+=("-DGGML_SYCL=ON")
-            else
-                echo -e "${B_RED}[!] Intel OneAPI not found. SYCL build will likely fail.${NC}" | tee -a "$LOG_FILE"
-                read -p "Continue anyway with CPU fallback? (y/n): " sycl_fallback
-                [[ "$sycl_fallback" != "y" ]] && { read -p "Press Enter..."; return; }
+
+            # Locate setvars.sh dynamically — do NOT use a hardcoded path.
+            # Source with --force so a "already been run" warning doesn't make
+            # the exit code non-zero and falsely trigger the fallback branch.
+            local SETVARS_BUILD=""
+            SETVARS_BUILD=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
+
+            local sycl_ready=0
+            if [[ -n "$SETVARS_BUILD" ]]; then
+                # Suppress the "already run" warning — it prints to stdout and
+                # pollutes the log; redirect to /dev/null, only keep errors.
+                source "$SETVARS_BUILD" --force > /dev/null 2>&1 || true
+                # Trust icx presence, not the source exit code
+                if command -v icx &>/dev/null \
+                || find /opt/intel/oneapi -name icx -type f 2>/dev/null | grep -q .; then
+                    echo "OneAPI environment loaded (icx confirmed)." | tee -a "$LOG_FILE"
+                    cmake_flags+=("-DGGML_SYCL=ON")
+                    sycl_ready=1
+                fi
+            fi
+
+            if (( sycl_ready == 0 )); then
+                echo -e "${B_RED}[!] icx compiler not found after sourcing setvars.sh.${NC}" | tee -a "$LOG_FILE"
+                echo -e "${B_YELLOW}    Try: source /opt/intel/oneapi/setvars.sh --force${NC}"
+                read -rp "Continue anyway with CPU fallback? (y/n): " sycl_fallback
+                [[ "${sycl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
             fi
             ;;
         *)
@@ -786,18 +805,18 @@ download_menu() {
 
 # NEW: Interactive context size picker
 select_context_size() {
+    local doubled=$(( context_size * 2 ))
     echo -e "\n${B_CYAN}Select Context Window Size:${NC}"
     echo "  1)  1024  tokens  (minimal RAM, very short conversations)"
     echo "  2)  2048  tokens"
     echo "  3)  4096  tokens"
-    echo "  4)  8192  tokens  (current default)"
+    echo "  4)  8192  tokens  (default)"
     echo "  5) 16384  tokens"
     echo "  6) 32768  tokens  (large RAM / VRAM required)"
-    echo "  7) Type a number manually"
-    # -r prevents backslash mangling; reading to a fresh variable avoids
-    # any stale input left in the terminal buffer by prior select loops.
+    echo "  7) Double current → ${doubled} tokens"
+    echo "  8) Type a number manually"
     local c=""
-    read -r -p "Select [1-7]: " c
+    read -r -p "Select [1-8] (current: ${context_size}): " c
     case $c in
         1) declare -g context_size=1024 ;;
         2) declare -g context_size=2048 ;;
@@ -805,7 +824,8 @@ select_context_size() {
         4) declare -g context_size=8192 ;;
         5) declare -g context_size=16384 ;;
         6) declare -g context_size=32768 ;;
-        7)
+        7) declare -g context_size=$doubled ;;
+        8)
            local custom_ctx=""
            read -r -p "  Enter context size (min 512): " custom_ctx
            if [[ "$custom_ctx" =~ ^[0-9]+$ ]] && (( custom_ctx >= 512 )); then
