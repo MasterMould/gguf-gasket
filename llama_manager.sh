@@ -1319,14 +1319,17 @@ chat_mode() {
     echo -e "${B_YELLOW}  --no-context-shift: chat will STOP when context window is full${NC}"
 
     # Capture stderr to a temp file so we can diagnose crash reasons.
-    # Also suppress SYCL/GDB noise that leaks to the terminal on abort:
-    #   SYCL_PI_TRACE=-1 causes the runtime to invoke GDB on exceptions.
-    #   Setting it to 0 disables that behaviour entirely.
+    # IMPORTANT: use a direct redirect (2>"$stderr_log") not process substitution
+    # (2> >(tee ...)) — process substitution is async and the file may be empty
+    # when we read it immediately after the command completes.
+    # SYCL_PI_TRACE was renamed to SYCL_UR_TRACE in oneAPI 2024+; set both to 0
+    # to suppress the GDB-on-exception behaviour in all oneAPI versions.
     local stderr_log
     stderr_log=$(mktemp /tmp/llama_chat_stderr.XXXXXX)
     local chat_exit=0
 
     SYCL_PI_TRACE=0 \
+    SYCL_UR_TRACE=0 \
     ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
     "$BUILD_DIR/bin/llama-cli" \
         -c "$context_size" \
@@ -1334,18 +1337,20 @@ chat_mode() {
         -ngl "$ngl" \
         -cnv --prio 2 \
         --no-context-shift \
-        2> >(tee "$stderr_log" >&2) \
+        2>"$stderr_log" \
         || chat_exit=$?
+
+    # Always echo stderr to the terminal so the user sees live output,
+    # then use the captured file for diagnosis.
+    cat "$stderr_log" >&2
 
     if (( chat_exit != 0 )); then
         echo -e ""
-        # Read captured stderr to diagnose the failure reason
         local stderr_content
         stderr_content=$(cat "$stderr_log" 2>/dev/null || true)
         rm -f "$stderr_log"
 
-        if echo "$stderr_content" | grep -q "No device of requested type"; then
-            # SYCL found no GPU — almost always a render group / re-login issue
+        if echo "$stderr_content" | grep -qi "No device of requested type\|no devices\|SYCL.*not found\|level.zero.*error"; then
             echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
             echo -e "${B_RED}║  ✖  SYCL: No GPU device found (exit $chat_exit)$(printf '%*s' $((16 - ${#chat_exit})) '')║${NC}"
             echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
@@ -1354,8 +1359,7 @@ chat_mode() {
             echo -e "${B_RED}║${NC}  Fix: ${B_YELLOW}log out and log back in${NC}, then retry.  ${B_RED}║${NC}"
             echo -e "${B_RED}║${NC}  Or use ${B_YELLOW}0 GPU layers${NC} to run on CPU instead. ${B_RED}║${NC}"
             echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
-        elif echo "$stderr_content" | grep -q "ggml_context_shift\|context full\|KV cache"; then
-            # Context window exhausted
+        elif echo "$stderr_content" | grep -qi "context.shift\|context full\|KV cache\|kv.cache"; then
             echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
             echo -e "${B_RED}║  Chat ended — context window full (exit $chat_exit)$(printf '%*s' $((7 - ${#chat_exit})) '')║${NC}"
             echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
@@ -1363,13 +1367,12 @@ chat_mode() {
             echo -e "${B_RED}║${NC}  Increase it in ${B_YELLOW}Settings → Context Size${NC}.     ${B_RED}║${NC}"
             echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
         else
-            # Generic non-zero exit
             echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
             echo -e "${B_RED}║  Chat ended (exit code $chat_exit)$(printf '%*s' $((31 - ${#chat_exit})) '')║${NC}"
             echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
-            echo -e "${B_RED}║${NC}  Check forensic logs (menu option 8) for     ${B_RED}║${NC}"
-            echo -e "${B_RED}║${NC}  details. If GPU layers were set > 0, try    ${B_RED}║${NC}"
-            echo -e "${B_RED}║${NC}  reducing them or switching to CPU only.     ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Last error lines shown above. For full log: ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  use ${B_YELLOW}menu option 8${NC} → View Forensic Logs.    ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  If GPU layers > 0, try ${B_YELLOW}0 layers (CPU)${NC}.     ${B_RED}║${NC}"
             echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
         fi
     else
@@ -1467,6 +1470,7 @@ manage_server() {
     # FIX: Use --ctx-size (llama-server flag); -c is llama-cli only in
     #      recent llama.cpp builds and is silently ignored by the server.
     SYCL_PI_TRACE=0 \
+    SYCL_UR_TRACE=0 \
     ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
     "$BUILD_DIR/bin/llama-server" \
         -m "$model" \
