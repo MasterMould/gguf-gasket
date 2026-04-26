@@ -1283,6 +1283,30 @@ chat_mode() {
     local current_gpu
     current_gpu=$(detect_gpu)
 
+    # ── Intel SYCL pre-flight: check render group membership ────────────
+    # SYCL requires access to /dev/dri/renderD128 which is owned by the
+    # 'render' group. Group changes only take effect after a full re-login.
+    # Detect this early and warn before launching rather than showing a
+    # cryptic "No device of requested type available" crash.
+    if [[ "$current_gpu" == "INTEL" ]]; then
+        if ! id -Gn 2>/dev/null | grep -qw "render"; then
+            echo -e ""
+            echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "${B_RED}║  ⚠  Intel GPU — 'render' group missing       ║${NC}"
+            echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+            echo -e "${B_RED}║${NC}  SYCL needs /dev/dri/render access.          ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  The build added you to 'render' but group   ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  membership needs a ${B_YELLOW}full log-out + log-in${NC}.   ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  After re-login, SYCL will find your GPU.    ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  To continue now with ${B_YELLOW}CPU fallback${NC}:          ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}    Select 0 GPU layers at the next prompt.   ${B_RED}║${NC}"
+            echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+            echo ""
+            read -rp "  Continue anyway? (y/n): " grp_cont
+            [[ "${grp_cont,,}" != "y" ]] && return
+        fi
+    fi
+
     local model
     model=$(select_model "Select model for chat [#]: ") || return
 
@@ -1294,24 +1318,62 @@ chat_mode() {
     echo -e "${B_YELLOW}  (Type /bye to quit or Ctrl+C to force exit)${NC}"
     echo -e "${B_YELLOW}  --no-context-shift: chat will STOP when context window is full${NC}"
 
+    # Capture stderr to a temp file so we can diagnose crash reasons.
+    # Also suppress SYCL/GDB noise that leaks to the terminal on abort:
+    #   SYCL_PI_TRACE=-1 causes the runtime to invoke GDB on exceptions.
+    #   Setting it to 0 disables that behaviour entirely.
+    local stderr_log
+    stderr_log=$(mktemp /tmp/llama_chat_stderr.XXXXXX)
     local chat_exit=0
+
+    SYCL_PI_TRACE=0 \
+    ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
     "$BUILD_DIR/bin/llama-cli" \
         -c "$context_size" \
         -m "$model" \
         -ngl "$ngl" \
         -cnv --prio 2 \
         --no-context-shift \
+        2> >(tee "$stderr_log" >&2) \
         || chat_exit=$?
 
     if (( chat_exit != 0 )); then
         echo -e ""
-        echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${B_RED}║  Chat ended (exit code $chat_exit)$(printf '%*s' $((31 - ${#chat_exit})) '')║${NC}"
-        echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
-        echo -e "${B_RED}║${NC}  If the session ran long, the context window  ${B_RED}║${NC}"
-        echo -e "${B_RED}║${NC}  (${B_YELLOW}$context_size tokens${NC}) was likely full.$(printf '%*s' $((14 - ${#context_size})) '')${B_RED}║${NC}"
-        echo -e "${B_RED}║${NC}  Increase it in ${B_YELLOW}Settings → Context Size${NC}.     ${B_RED}║${NC}"
-        echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        # Read captured stderr to diagnose the failure reason
+        local stderr_content
+        stderr_content=$(cat "$stderr_log" 2>/dev/null || true)
+        rm -f "$stderr_log"
+
+        if echo "$stderr_content" | grep -q "No device of requested type"; then
+            # SYCL found no GPU — almost always a render group / re-login issue
+            echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "${B_RED}║  ✖  SYCL: No GPU device found (exit $chat_exit)$(printf '%*s' $((16 - ${#chat_exit})) '')║${NC}"
+            echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+            echo -e "${B_RED}║${NC}  The SYCL runtime could not see any GPU.     ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Most likely cause: not yet in 'render' group${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Fix: ${B_YELLOW}log out and log back in${NC}, then retry.  ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Or use ${B_YELLOW}0 GPU layers${NC} to run on CPU instead. ${B_RED}║${NC}"
+            echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        elif echo "$stderr_content" | grep -q "ggml_context_shift\|context full\|KV cache"; then
+            # Context window exhausted
+            echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "${B_RED}║  Chat ended — context window full (exit $chat_exit)$(printf '%*s' $((7 - ${#chat_exit})) '')║${NC}"
+            echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+            echo -e "${B_RED}║${NC}  Context: ${B_YELLOW}$context_size tokens${NC} was exhausted.$(printf '%*s' $((12 - ${#context_size})) '')${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Increase it in ${B_YELLOW}Settings → Context Size${NC}.     ${B_RED}║${NC}"
+            echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        else
+            # Generic non-zero exit
+            echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "${B_RED}║  Chat ended (exit code $chat_exit)$(printf '%*s' $((31 - ${#chat_exit})) '')║${NC}"
+            echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+            echo -e "${B_RED}║${NC}  Check forensic logs (menu option 8) for     ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  details. If GPU layers were set > 0, try    ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  reducing them or switching to CPU only.     ${B_RED}║${NC}"
+            echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        fi
+    else
+        rm -f "$stderr_log"
     fi
 
     read -p "Press Enter to return to menu..."
@@ -1350,6 +1412,18 @@ manage_server() {
 
     local current_gpu
     current_gpu=$(detect_gpu)
+
+    # Intel SYCL render group pre-check (same as chat_mode)
+    if [[ "$current_gpu" == "INTEL" ]]; then
+        if ! id -Gn 2>/dev/null | grep -qw "render"; then
+            WARN "Not in 'render' group — SYCL will crash at startup."
+            WARN "Log out and log back in, then restart the server."
+            WARN "Or set GPU layers to 0 to use CPU-only mode."
+            echo ""
+            read -rp "  Continue anyway? (y/n): " grp_srv
+            [[ "${grp_srv,,}" != "y" ]] && return
+        fi
+    fi
 
     local model
     model=$(select_model "Select model for server [#]: ") || return
@@ -1392,6 +1466,8 @@ manage_server() {
 
     # FIX: Use --ctx-size (llama-server flag); -c is llama-cli only in
     #      recent llama.cpp builds and is silently ignored by the server.
+    SYCL_PI_TRACE=0 \
+    ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
     "$BUILD_DIR/bin/llama-server" \
         -m "$model" \
         -ngl "$ngl" \
