@@ -167,18 +167,6 @@ check_deps() {
 
 # ================================================================
 #  HARDWARE DETECTION ENGINE
-#
-#  FIX: install_AMD_gpu_drivers() and install_intel_gpu_drivers()
-#       were called directly inside detect_gpu(). This caused driver
-#       installation to trigger on every single status check and menu
-#       refresh — a serious unintended side-effect. Detection now only
-#       prints the GPU type; installation is left to build_engine()
-#       and deep_repair() where it belongs.
-#
-#  FIX: The Intel elif block contained orphaned if/else statements
-#       (Arc OpenCL and lspci checks) that ran after 'echo "INTEL"'
-#       but produced no useful return value and mixed stdout with the
-#       detect_gpu output, breaking callers.
 # ================================================================
 detect_gpu() {
     local gpu_info
@@ -220,230 +208,242 @@ install_intel_gpu_drivers() {
     STEP "Installing Intel Arc GPU drivers (OpenCL + level-zero + oneAPI)…"
     INFO "Checking Intel GPU driver packages…"
 
-    # ── 1. Intel GPU compute-runtime repo (OpenCL ICD + level-zero shim) ──
-    # The repo layout changed: Noble (24.04) uses 'ubuntu2404' not 'noble unified'.
-    # The key must be fetched with curl (wget -O- has broken pipe issues with gpg).
-    if [[ ! -f /etc/apt/sources.list.d/intel-gpu-noble.list ]]; then
-        INFO "  Adding Intel GPU repo for Ubuntu 24.04 Noble…"
-        curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key \
-            | sudo gpg --yes --dearmor \
-                --output /usr/share/keyrings/intel-graphics.gpg \
-            || { ERR "Failed to import Intel GPU key."; return 1; }
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
-https://repositories.intel.com/gpu/ubuntu noble client" \
-            | sudo tee /etc/apt/sources.list.d/intel-gpu-noble.list > /dev/null
-        sudo apt-get update -qq 2>&1 | tee -a "$LOG_FILE" || true
-    else
-        INFO "  Intel GPU repo already present."
+STATE_FILE="/var/tmp/intel_arc_install.state"
+LOG_FILE="/var/tmp/intel_arc_install.log"
+
+# ---------- logging ----------
+log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
+err(){ log "ERROR: $*"; }
+ok(){ log "OK: $*"; }
+warn(){ log "WARN: $*"; }
+
+# ---------- state ----------
+save_state(){ echo "$1" > "$STATE_FILE"; }
+load_state(){ [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || echo ""; }
+
+# ---------- detection ----------
+detect(){
+  KERNEL=$(uname -r)
+  UBUNTU=$(lsb_release -rs 2>/dev/null || echo unknown)
+  GPU=$(lspci | grep -Ei 'intel|vga|display|3d' || true)
+  DRIVER=$(lsmod | grep -E 'i915|xe' | awk '{print $1}' | head -1)
+}
+
+# ---------- dependency recovery ----------
+fix_broken_packages() {
+  warn "Deep dependency recovery engaged..."
+
+  sudo apt-mark showhold | tee /tmp/held_pkgs.txt
+
+  # unhold everything (safe in this context)
+  if [[ -s /tmp/held_pkgs.txt ]]; then
+    warn "Releasing held packages"
+    sudo apt-mark unhold $(cat /tmp/held_pkgs.txt) || true
+  fi
+
+  # remove known conflict packages
+  if dpkg -l | grep -q libmetee4; then
+    warn "Force-removing libmetee4 and dependents"
+    sudo apt remove --purge -y libmetee4 intel-igc-cm || true
+  fi
+
+  # aggressive cleanup
+  sudo apt autoremove -y || true
+  sudo apt clean
+
+  # repair system
+  sudo apt --fix-broken install -y || true
+}
+
+safe_apt_install() {
+  if ! sudo apt-get install -y "$@"; then
+    warn "Install failed → entering recovery mode"
+    fix_broken_packages
+
+    if ! sudo apt-get install -y "$@"; then
+      err "Second attempt failed → escalating"
+
+      # final brute-force attempt
+      sudo dpkg --configure -a || true
+      sudo apt --fix-broken install -y || true
+
+      sudo apt-get install -y "$@" || return 1
     fi
+  fi
+}
 
-    # ── 2. Required runtime packages ──
-    local PKGS=()
+# ---------- diagnostics ----------
+diagnose(){
+  detect
+  echo "=== SYSTEM ==="
+  echo "Kernel: $KERNEL"
+  echo "Ubuntu: $UBUNTU"
+  echo "GPU: ${GPU:-not detected}"
+  echo "Driver: ${DRIVER:-none}"
 
-    # OpenCL ICD (userspace OpenCL dispatcher)
-    if dpkg -s intel-opencl-icd &>/dev/null 2>&1; then
-        INFO "  intel-opencl-icd     ✓ already installed"
-    else
-        PKGS+=("intel-opencl-icd")
+  echo "=== RUNTIME ==="
+  clinfo -l 2>/dev/null | grep -i intel || echo "OpenCL: FAIL"
+  sycl-ls 2>/dev/null | grep -i gpu || echo "SYCL: FAIL"
+  vainfo 2>/dev/null | grep -i intel || echo "VAAPI: FAIL"
+  vulkaninfo 2>/dev/null | grep -i intel || echo "Vulkan: FAIL"
+  xpu-smi discovery 2>/dev/null || echo "xpu-smi: FAIL"
+}
+
+detect_repo_conflict() {
+  if apt-get install -y intel-gsc 2>&1 | grep -q "libmetee"; then
+    warn "Detected repo mismatch (metee conflict)"
+    return 0
+  fi
+  return 1
+}
+
+if detect_repo_conflict; then
+  warn "Switching to consistent repo mode (removing Intel GPU repo)"
+
+  sudo rm -f /etc/apt/sources.list.d/intel-gpu.list
+  sudo apt update
+  sudo apt --fix-broken install -y
+fi
+
+
+
+# ---------- fixes ----------
+fix_kernel(){
+  log "Ensuring HWE kernel"
+  safe_apt_install linux-generic-hwe-24.04
+}
+
+fix_graphics(){
+  log "Installing graphics stack"
+  safe_apt_install \
+    mesa-vulkan-drivers \
+    mesa-opencl-icd \
+    intel-media-va-driver-non-free \
+    vainfo libvpl2 intel-gsc xpu-smi
+}
+
+fix_compute(){
+  log "Installing compute runtime"
+  safe_apt_install intel-opencl-icd intel-level-zero-gpu libze1 libze-dev clinfo
+}
+
+fix_oneapi(){
+  if ! command -v icx >/dev/null; then
+    log "Installing oneAPI compiler"
+    safe_apt_install intel-oneapi-compiler-dpcpp-cpp
+  else
+    ok "icx already present"
+  fi
+}
+
+fix_permissions(){
+  sudo usermod -aG render,video "$USER" || true
+  warn "Re-login required for GPU access"
+}
+
+# ---------- intelligent repair ----------
+repair_loop(){
+  for i in {1..4}; do
+    log "Repair pass $i"
+
+    clinfo >/dev/null 2>&1 || fix_compute
+    sycl-ls >/dev/null 2>&1 || fix_oneapi
+    vainfo >/dev/null 2>&1 || fix_graphics
+
+    if clinfo >/dev/null 2>&1 && sycl-ls >/dev/null 2>&1; then
+      ok "Core compute stack working"
+      return
     fi
+  done
 
-    # level-zero GPU shim — accept either package name (repo changed it)
-    if dpkg -s libze-intel-gpu1 &>/dev/null 2>&1 \
-    || dpkg -s intel-level-zero-gpu &>/dev/null 2>&1; then
-        INFO "  level-zero GPU shim  ✓ already installed"
-    else
-        PKGS+=("libze-intel-gpu1")
-    fi
+  err "Automatic repair incomplete"
+}
 
-    # level-zero ICD loader
-    if dpkg -s libze1 &>/dev/null 2>&1; then
-        INFO "  libze1               ✓ already installed"
-    else
-        PKGS+=("libze1")
-    fi
+# ---------- install modes ----------
+install_stable(){
+  save_state "stable"
+  fix_kernel
+  fix_graphics
+  fix_compute
+  fix_oneapi
+  fix_permissions
+  repair_loop
+}
 
-    if [[ ${#PKGS[@]} -gt 0 ]]; then
-        INFO "  Installing GPU runtime: ${PKGS[*]}"
-        sudo apt-get install -y "${PKGS[@]}" 2>&1 | tee -a "$LOG_FILE" || {
-            ERR "Failed to install GPU runtime packages."
-            WARN "  Try: sudo apt-get update && sudo apt-get install ${PKGS[*]}"
-        }
-    fi
+install_performance(){
+  save_state "performance"
+  fix_kernel
+  fix_graphics
+  fix_compute
+  fix_oneapi
+  repair_loop
+}
 
-    # clinfo + level-zero dev headers (optional, non-fatal)
-    sudo apt-get install -y --no-install-recommends clinfo libze-dev 2>&1 \
-        | tee -a "$LOG_FILE" || true
+install_bleeding(){
+  save_state "bleeding"
+  log "Enabling experimental stack"
+  sudo add-apt-repository -y ppa:kobuk-team/intel-graphics || true
+  sudo apt-get update
+  install_performance
+}
 
-    # MKL (Math Kernel Library) — required by llama.cpp SYCL backend cmake
-    # Without MKL the cmake step fails with "Could not find package MKL"
-    if dpkg -s intel-oneapi-mkl-devel &>/dev/null 2>&1; then
-        INFO "  intel-oneapi-mkl-devel ✓ already installed"
-    else
-        INFO "  Installing intel-oneapi-mkl-devel (required for SYCL cmake)…"
-        sudo apt-get install -y intel-oneapi-mkl-devel 2>&1 | tee -a "$LOG_FILE" || {
-            ERR "Failed to install intel-oneapi-mkl-devel."
-            WARN "  Run manually: sudo apt-get install intel-oneapi-mkl-devel"
-        }
-    fi
+# ---------- resume ----------
+resume(){
+  state=$(load_state)
+  [[ -z "$state" ]] && { warn "No previous state"; return; }
+  log "Resuming from $state"
+  case $state in
+    stable) install_stable ;;
+    performance) install_performance ;;
+    bleeding) install_bleeding ;;
+  esac
+}
 
-    OK "Intel GPU runtime packages ready."
+# ---------- menu ----------
+menu(){
+  while true; do
+    clear
+    echo "========================================"
+    echo "   Intel Arc Smart Installer (2026)"
+    echo "========================================"
 
-    # ── 3. Intel oneAPI SYCL compiler ──
-    INFO "Checking Intel oneAPI SYCL compiler…"
+    detect
+    echo "System Snapshot:"
+    echo "  Kernel : $KERNEL"
+    echo "  GPU    : ${GPU:-not detected}"
+    echo "  Driver : ${DRIVER:-none}"
+    echo "========================================"
+    echo "Choose an option:"
+    echo "  1) 🧠 Smart Install (auto fix everything)"
+    echo "  2) 🟢 Stable Setup"
+    echo "  3) ⚡ Performance Stack"
+    echo "  4) 🔥 Bleeding Edge"
+    echo "  5) 🔍 Diagnostics"
+    echo "  6) 🛠 Repair"
+    echo "  7) 🔁 Resume"
+    echo "  8) 🚪 Exit"
 
-    # Check for icx on PATH first before attempting any setvars sourcing.
-    # setvars.sh writes "already been run" warnings directly to /dev/tty from
-    # sub-scripts — no redirect can suppress this. Only source it when icx is
-    # genuinely absent from the session.
-    local ICX_BIN=""
-    ICX_BIN=$(command -v icx 2>/dev/null) || true
-    # Always verify PATH icx is the newest installed — an upgrade may leave PATH stale
-    if [[ -n "$ICX_BIN" ]]; then
-        local path_ver newest_installed
-        path_ver=$(echo "$ICX_BIN" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
-        newest_installed=$(find /opt/intel/oneapi/compiler -maxdepth 1 -mindepth 1 \
-            -type d 2>/dev/null | grep -oP '\d{4}\.\d[\d.]*' | sort -rV | head -1) || true
-        if [[ -n "$newest_installed" && "$path_ver" != "${newest_installed%%.*}" ]]; then
-            ICX_BIN=$(find /opt/intel/oneapi/compiler/"$newest_installed"/bin \
-                -name icx -type f 2>/dev/null | head -1) || true
-        fi
-    fi
-    if [[ -z "$ICX_BIN" ]]; then
-        ICX_BIN=$(find /opt/intel/oneapi/compiler -name icx -type f \
-            2>/dev/null | sort -rV | head -1) || true
-    fi
+    read -rp "Enter choice [1-8]: " choice
 
-    if [[ -n "$ICX_BIN" ]]; then
-        OK "Intel icx compiler found: $ICX_BIN"
+    case $choice in
+      1) install_stable ;;
+      2) install_stable ;;
+      3) install_performance ;;
+      4) install_bleeding ;;
+      5) diagnose ;;
+      6) repair_loop ;;
+      7) resume ;;
+      8) echo "Goodbye"; break ;;
+      *) echo "Invalid"; sleep 1 ;;
+    esac
 
-        # ── ABI VERSION SYNC CHECK ──────────────────────────────────────────
-        # MKL and the SYCL compiler (icx/icpx) must come from the same oneAPI
-        # generation. MKL 2026 ships libmkl_sycl_blas.so.6 linked against
-        # libsycl.so.9 (oneAPI 2026 compiler). If icx is 2025.x, libsycl.so.9
-        # does not exist → "undefined reference to sycl::_V1::*" at link time.
-        # Solution: upgrade icx/icpx to match the installed MKL major version.
-        local MKL_MAJOR=""
-        MKL_MAJOR=$(find /opt/intel/oneapi/mkl -maxdepth 1 -mindepth 1 -type d \
-            2>/dev/null | grep -oP '\d{4}' | sort -rn | head -1) || true
+    read -rp "Press Enter to continue..."
+  done
+}
 
-        local ICX_MAJOR=""
-        ICX_MAJOR=$(echo "$ICX_BIN" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
-
-        if [[ -n "$MKL_MAJOR" && -n "$ICX_MAJOR" && "$MKL_MAJOR" != "$ICX_MAJOR" ]]; then
-            WARN "Version mismatch: MKL ${MKL_MAJOR} vs compiler ${ICX_MAJOR}."
-            WARN "  MKL requires libsycl.so from oneAPI ${MKL_MAJOR} compiler."
-            WARN "  Upgrading intel-oneapi-compiler-dpcpp-cpp to match…"
-            sudo apt-get update -qq &>> "$LOG_FILE" || true
-            local upgraded=0
-            for pkg in intel-oneapi-compiler-dpcpp-cpp intel-oneapi-dpcpp-cpp; do
-                if sudo apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE" | grep -q "upgraded\|newly installed"; then
-                    upgraded=1; break
-                fi
-                # apt-get returns 0 even when nothing changed; check dpkg explicitly
-                if dpkg -s "$pkg" &>/dev/null 2>&1; then
-                    sudo apt-get install --only-upgrade -y "$pkg" 2>&1 | tee -a "$LOG_FILE" || true
-                    upgraded=1; break
-                fi
-            done
-
-            # Re-locate icx after potential upgrade — sort -rV ensures newest wins
-            ICX_BIN=$(find /opt/intel/oneapi/compiler -name icx -type f 2>/dev/null \
-                | sort -rV | head -1) || true
-            ICX_MAJOR=$(echo "$ICX_BIN" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
-
-            if [[ "$MKL_MAJOR" == "$ICX_MAJOR" ]]; then
-                OK "Compiler upgraded to match MKL ${MKL_MAJOR}."
-            else
-                WARN "Compiler still at ${ICX_MAJOR} — apt may not have a ${MKL_MAJOR} package yet."
-                WARN "  The build may fail with linker errors."
-                WARN "  Alternatively: sudo apt-get install intel-oneapi-mkl-devel=2025.* to downgrade MKL."
-            fi
-        fi
-
-        # Ensure its bin dir is on PATH for sub-processes (cmake etc.)
-        export PATH="$(dirname "$ICX_BIN"):$PATH"
-    else
-        INFO "icx not on PATH — sourcing oneAPI setvars.sh for first-time setup…"
-
-        local SETVARS=""
-        SETVARS=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
-
-        if [[ -z "$SETVARS" ]]; then
-            # oneAPI not installed at all — add repo and install compiler
-            INFO "Installing Intel oneAPI SYCL compiler…"
-            if [[ ! -f /etc/apt/sources.list.d/oneAPI.list ]]; then
-                curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
-                    | sudo gpg --yes --dearmor \
-                        --output /usr/share/keyrings/oneapi-archive-keyring.gpg \
-                    || { ERR "Failed to import oneAPI GPG key."; return 1; }
-                echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] \
-https://apt.repos.intel.com/oneapi all main" \
-                    | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
-                sudo apt-get update -qq 2>&1 | tee -a "$LOG_FILE" || true
-            fi
-
-            # Try package names in order of preference
-            local installed_oneapi=0
-            for pkg in intel-oneapi-compiler-dpcpp-cpp intel-oneapi-dpcpp-cpp; do
-                if sudo apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
-                    installed_oneapi=1
-                    break
-                fi
-            done
-
-            if (( installed_oneapi == 0 )); then
-                ERR "Could not install any oneAPI SYCL compiler package."
-                WARN "  Check: sudo apt-get update && apt-cache search oneapi | grep dpcpp"
-                return 1
-            fi
-        fi
-
-        # Locate icx after install — use find, do NOT re-source setvars
-        ICX_BIN=$(command -v icx 2>/dev/null) \
-            || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
-            || true
-
-        if [[ -n "$ICX_BIN" ]]; then
-            export PATH="$(dirname "$ICX_BIN"):$PATH"
-            OK "icx ready: $ICX_BIN"
-        else
-            ERR "icx still not found — check apt output in $LOG_FILE"
-            WARN "  Open a new terminal and run: source /opt/intel/oneapi/setvars.sh"
-        fi
-    fi
-
-    # ── 4. Patch shell profiles so setvars.sh loads at login ──
-    # Find setvars path — variable may not be set if icx was already on PATH above
-    local SETVARS_FOR_PROFILE=""
-    SETVARS_FOR_PROFILE=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
-    if [[ -n "$SETVARS_FOR_PROFILE" ]]; then
-        local SETVARS_LINE="source \"$SETVARS_FOR_PROFILE\" 2>/dev/null || true  # Intel oneAPI"
-        for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-            if [[ -f "$rc" ]] && ! grep -q "Intel oneAPI" "$rc" 2>/dev/null; then
-                echo "" >> "$rc"
-                echo "$SETVARS_LINE" >> "$rc"
-                INFO "  Patched $rc with oneAPI setvars.sh"
-            fi
-        done
-    fi
-
-    # ── 5. Groups + verify ──
-    sudo usermod -aG render,video "$USER" 2>/dev/null || true
-    OK "User added to render/video groups (re-login to take effect)."
-
-    INFO "Quick GPU visibility check:"
-    if command -v clinfo &>/dev/null; then
-        clinfo -l 2>/dev/null | grep -i "intel\|Arc" \
-            && OK "  Intel GPU visible via OpenCL" \
-            || WARN "  Intel GPU NOT visible via OpenCL (may need re-login)"
-    fi
-
-    if dpkg -s libze-intel-gpu1 &>/dev/null 2>&1 \
-    || dpkg -s intel-level-zero-gpu &>/dev/null 2>&1; then
-        OK "  level-zero GPU shim installed — SYCL will see the GPU after re-login"
-    else
-        WARN "  level-zero shim NOT installed — SYCL will not find the GPU"
-    fi
+# ---------- entry ----------
+detect
+menu
 }
 
 # ================================================================
