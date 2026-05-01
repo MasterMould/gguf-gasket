@@ -167,18 +167,6 @@ check_deps() {
 
 # ================================================================
 #  HARDWARE DETECTION ENGINE
-#
-#  FIX: install_AMD_gpu_drivers() and install_intel_gpu_drivers()
-#       were called directly inside detect_gpu(). This caused driver
-#       installation to trigger on every single status check and menu
-#       refresh — a serious unintended side-effect. Detection now only
-#       prints the GPU type; installation is left to build_engine()
-#       and deep_repair() where it belongs.
-#
-#  FIX: The Intel elif block contained orphaned if/else statements
-#       (Arc OpenCL and lspci checks) that ran after 'echo "INTEL"'
-#       but produced no useful return value and mixed stdout with the
-#       detect_gpu output, breaking callers.
 # ================================================================
 detect_gpu() {
     local gpu_info
@@ -582,14 +570,6 @@ install_to_path() {
     INFO "  (New terminals will pick this up automatically)"
 }
 
-
-#
-#  FIX 1: 'sudo apt-get install -y' with no packages (bare command)
-#          was left on its own line and would error — removed.
-#  FIX 2: Continuation backslash had a trailing space ('cmake \ ')
-#          which breaks line continuation — fixed.
-#  FIX 3: install_AMD/INTEL gpu drivers are now called here during
-#          build so the correct stack is present before compiling.
 # ================================================================
 build_engine() {
     draw_header
@@ -1024,7 +1004,7 @@ download_menu() {
         fi
 
         echo "  Select model to download:"
-        echo "  1) Llama-3-8B  (Smart mid-size — NousResearch Q4_K_M ~4.9 GB)"
+        echo "  1) gemma-4-E4B-it-OBLITERATED  (Smart mid-size — Google Q5_K_M ~5.76 GB)"
         echo "  2) Mistral-7B  (Industry standard — TheBloke Q4_K_M ~4.1 GB)"
         echo "  3) Phi-3-Mini  (Tiny but powerful — bartowski Q4_K_M ~2.2 GB)"
         echo "  4) Custom URL  (Paste direct GGUF link)"
@@ -1036,7 +1016,7 @@ download_menu() {
 
         local url="" filename=""
         case $d in
-            1) url="https://huggingface.co/NousResearch/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
+            1) url="https://huggingface.co/OBLITERATUS/gemma-4-E4B-it-OBLITERATED/blob/main/gemma-4-E4B-it-OBLITERATED-Q5_K_M.gguf"
                filename="llama3-8b.gguf" ;;
             2) url="https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
                filename="mistral-7b.gguf" ;;
