@@ -208,8 +208,8 @@ install_Nvidia_gpu_drivers() {
 install_AMD_gpu_drivers() {
     STEP "Installing AMD / Vulkan dependencies…"
     sudo apt-get install -y \
-        libnuma-dev libvulkan-dev wget vulkan-tools \
-        glslang-tools gnupg2 &>> "$LOG_FILE" || true
+        libnuma-dev spirv-headers libvulkan-dev wget glsc glslang-dev vulkan-tools \
+        vulkan-headers libvulk mesa-vulkan-drivers glslang-tools gnupg2 &>> "$LOG_FILE" || true
     # Note: libvulkan-dev:i386 requires multiarch; install separately if needed.
     sudo dpkg --add-architecture i386 2>/dev/null || true
     sudo apt-get update -qq &>> "$LOG_FILE" || true
@@ -274,71 +274,150 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
     sudo apt-get install -y --no-install-recommends clinfo libze-dev 2>&1 \
         | tee -a "$LOG_FILE" || true
 
+    # MKL (Math Kernel Library) — required by llama.cpp SYCL backend cmake
+    # Without MKL the cmake step fails with "Could not find package MKL"
+    if dpkg -s intel-oneapi-mkl-devel &>/dev/null 2>&1; then
+        INFO "  intel-oneapi-mkl-devel ✓ already installed"
+    else
+        INFO "  Installing intel-oneapi-mkl-devel (required for SYCL cmake)…"
+        sudo apt-get install -y intel-oneapi-mkl-devel 2>&1 | tee -a "$LOG_FILE" || {
+            ERR "Failed to install intel-oneapi-mkl-devel."
+            WARN "  Run manually: sudo apt-get install intel-oneapi-mkl-devel"
+        }
+    fi
+
     OK "Intel GPU runtime packages ready."
 
     # ── 3. Intel oneAPI SYCL compiler ──
-    # Package was renamed: 'intel-oneapi-compiler-dpcpp-cpp' is the current name.
-    # 'intel-oneapi-dpcpp-cpp' and 'intel-oneapi-compiler-dpcpp-cpp-2024' are aliases
-    # that may or may not exist depending on repo version — try in order.
     INFO "Checking Intel oneAPI SYCL compiler…"
 
-    # Source setvars.sh first in case icx is already installed but not on PATH
-    local SETVARS=""
-    SETVARS=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
-    [[ -n "$SETVARS" ]] && source "$SETVARS" 2>/dev/null || true
-
+    # Check for icx on PATH first before attempting any setvars sourcing.
+    # setvars.sh writes "already been run" warnings directly to /dev/tty from
+    # sub-scripts — no redirect can suppress this. Only source it when icx is
+    # genuinely absent from the session.
     local ICX_BIN=""
-    ICX_BIN=$(command -v icx 2>/dev/null) \
-        || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
-        || true
+    ICX_BIN=$(command -v icx 2>/dev/null) || true
+    # Always verify PATH icx is the newest installed — an upgrade may leave PATH stale
+    if [[ -n "$ICX_BIN" ]]; then
+        local path_ver newest_installed
+        path_ver=$(echo "$ICX_BIN" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
+        newest_installed=$(find /opt/intel/oneapi/compiler -maxdepth 1 -mindepth 1 \
+            -type d 2>/dev/null | grep -oP '\d{4}\.\d[\d.]*' | sort -rV | head -1) || true
+        if [[ -n "$newest_installed" && "$path_ver" != "${newest_installed%%.*}" ]]; then
+            ICX_BIN=$(find /opt/intel/oneapi/compiler/"$newest_installed"/bin \
+                -name icx -type f 2>/dev/null | head -1) || true
+        fi
+    fi
+    if [[ -z "$ICX_BIN" ]]; then
+        ICX_BIN=$(find /opt/intel/oneapi/compiler -name icx -type f \
+            2>/dev/null | sort -rV | head -1) || true
+    fi
 
     if [[ -n "$ICX_BIN" ]]; then
         OK "Intel icx compiler found: $ICX_BIN"
-    else
-        INFO "Installing Intel oneAPI SYCL compiler…"
 
-        # Ensure the oneAPI APT repo is present
-        if [[ ! -f /etc/apt/sources.list.d/oneAPI.list ]]; then
-            curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
-                | sudo gpg --yes --dearmor \
-                    --output /usr/share/keyrings/oneapi-archive-keyring.gpg \
-                || { ERR "Failed to import oneAPI GPG key."; return 1; }
-            echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] \
-https://apt.repos.intel.com/oneapi all main" \
-                | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
-            sudo apt-get update -qq 2>&1 | tee -a "$LOG_FILE" || true
-        fi
+        # ── ABI VERSION SYNC CHECK ──────────────────────────────────────────
+        # MKL and the SYCL compiler (icx/icpx) must come from the same oneAPI
+        # generation. MKL 2026 ships libmkl_sycl_blas.so.6 linked against
+        # libsycl.so.9 (oneAPI 2026 compiler). If icx is 2025.x, libsycl.so.9
+        # does not exist → "undefined reference to sycl::_V1::*" at link time.
+        # Solution: upgrade icx/icpx to match the installed MKL major version.
+        local MKL_MAJOR=""
+        MKL_MAJOR=$(find /opt/intel/oneapi/mkl -maxdepth 1 -mindepth 1 -type d \
+            2>/dev/null | grep -oP '\d{4}' | sort -rn | head -1) || true
 
-        # Try package names in order of preference
-        local installed_oneapi=0
-        for pkg in intel-oneapi-compiler-dpcpp-cpp intel-oneapi-dpcpp-cpp; do
-            if sudo apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
-                installed_oneapi=1
-                break
+        local ICX_MAJOR=""
+        ICX_MAJOR=$(echo "$ICX_BIN" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
+
+        if [[ -n "$MKL_MAJOR" && -n "$ICX_MAJOR" && "$MKL_MAJOR" != "$ICX_MAJOR" ]]; then
+            WARN "Version mismatch: MKL ${MKL_MAJOR} vs compiler ${ICX_MAJOR}."
+            WARN "  MKL requires libsycl.so from oneAPI ${MKL_MAJOR} compiler."
+            WARN "  Upgrading intel-oneapi-compiler-dpcpp-cpp to match…"
+            sudo apt-get update -qq &>> "$LOG_FILE" || true
+            local upgraded=0
+            for pkg in intel-oneapi-compiler-dpcpp-cpp intel-oneapi-dpcpp-cpp; do
+                if sudo apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE" | grep -q "upgraded\|newly installed"; then
+                    upgraded=1; break
+                fi
+                # apt-get returns 0 even when nothing changed; check dpkg explicitly
+                if dpkg -s "$pkg" &>/dev/null 2>&1; then
+                    sudo apt-get install --only-upgrade -y "$pkg" 2>&1 | tee -a "$LOG_FILE" || true
+                    upgraded=1; break
+                fi
+            done
+
+            # Re-locate icx after potential upgrade — sort -rV ensures newest wins
+            ICX_BIN=$(find /opt/intel/oneapi/compiler -name icx -type f 2>/dev/null \
+                | sort -rV | head -1) || true
+            ICX_MAJOR=$(echo "$ICX_BIN" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
+
+            if [[ "$MKL_MAJOR" == "$ICX_MAJOR" ]]; then
+                OK "Compiler upgraded to match MKL ${MKL_MAJOR}."
+            else
+                WARN "Compiler still at ${ICX_MAJOR} — apt may not have a ${MKL_MAJOR} package yet."
+                WARN "  The build may fail with linker errors."
+                WARN "  Alternatively: sudo apt-get install intel-oneapi-mkl-devel=2025.* to downgrade MKL."
             fi
-        done
-
-        if (( installed_oneapi == 0 )); then
-            ERR "Could not install any oneAPI SYCL compiler package."
-            WARN "  Check: sudo apt-get update && apt-cache search oneapi | grep dpcpp"
-            return 1
         fi
 
-        # Re-source and re-check
+        # Ensure its bin dir is on PATH for sub-processes (cmake etc.)
+        export PATH="$(dirname "$ICX_BIN"):$PATH"
+    else
+        INFO "icx not on PATH — sourcing oneAPI setvars.sh for first-time setup…"
+
+        local SETVARS=""
         SETVARS=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
-        [[ -n "$SETVARS" ]] && source "$SETVARS" 2>/dev/null || true
+
+        if [[ -z "$SETVARS" ]]; then
+            # oneAPI not installed at all — add repo and install compiler
+            INFO "Installing Intel oneAPI SYCL compiler…"
+            if [[ ! -f /etc/apt/sources.list.d/oneAPI.list ]]; then
+                curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+                    | sudo gpg --yes --dearmor \
+                        --output /usr/share/keyrings/oneapi-archive-keyring.gpg \
+                    || { ERR "Failed to import oneAPI GPG key."; return 1; }
+                echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] \
+https://apt.repos.intel.com/oneapi all main" \
+                    | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
+                sudo apt-get update -qq 2>&1 | tee -a "$LOG_FILE" || true
+            fi
+
+            # Try package names in order of preference
+            local installed_oneapi=0
+            for pkg in intel-oneapi-compiler-dpcpp-cpp intel-oneapi-dpcpp-cpp; do
+                if sudo apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
+                    installed_oneapi=1
+                    break
+                fi
+            done
+
+            if (( installed_oneapi == 0 )); then
+                ERR "Could not install any oneAPI SYCL compiler package."
+                WARN "  Check: sudo apt-get update && apt-cache search oneapi | grep dpcpp"
+                return 1
+            fi
+        fi
+
+        # Locate icx after install — use find, do NOT re-source setvars
         ICX_BIN=$(command -v icx 2>/dev/null) \
             || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
             || true
 
-        [[ -n "$ICX_BIN" ]] \
-            && OK "icx installed: $ICX_BIN" \
-            || ERR "icx still not found after install — check apt output in $LOG_FILE"
+        if [[ -n "$ICX_BIN" ]]; then
+            export PATH="$(dirname "$ICX_BIN"):$PATH"
+            OK "icx ready: $ICX_BIN"
+        else
+            ERR "icx still not found — check apt output in $LOG_FILE"
+            WARN "  Open a new terminal and run: source /opt/intel/oneapi/setvars.sh"
+        fi
     fi
 
     # ── 4. Patch shell profiles so setvars.sh loads at login ──
-    if [[ -n "$SETVARS" ]]; then
-        local SETVARS_LINE="source \"$SETVARS\" 2>/dev/null || true  # Intel oneAPI"
+    # Find setvars path — variable may not be set if icx was already on PATH above
+    local SETVARS_FOR_PROFILE=""
+    SETVARS_FOR_PROFILE=$(find /opt/intel/oneapi -name setvars.sh -type f 2>/dev/null | head -1) || true
+    if [[ -n "$SETVARS_FOR_PROFILE" ]]; then
+        local SETVARS_LINE="source \"$SETVARS_FOR_PROFILE\" 2>/dev/null || true  # Intel oneAPI"
         for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
             if [[ -f "$rc" ]] && ! grep -q "Intel oneAPI" "$rc" 2>/dev/null; then
                 echo "" >> "$rc"
@@ -471,6 +550,31 @@ install_to_path() {
     # Also export into the current session immediately
     export PATH="$bin_dir:$PATH"
 
+    # For Intel SYCL builds, also persist oneAPI runtime library paths so
+    # llama-server / llama-cli can find libsycl.so and libmkl_*.so when run
+    # directly from the terminal without the script having set LD_LIBRARY_PATH.
+    local oneapi_lib_line=""
+    local _sycl_lib _mkl_lib
+    _sycl_lib=$(find /opt/intel/oneapi/compiler -name "libsycl.so" -type f 2>/dev/null \
+        | sort -rV | head -1 | xargs -r dirname) || true
+    _mkl_lib=$(find /opt/intel/oneapi/mkl -maxdepth 3 -name "libmkl_core.so" -type f 2>/dev/null \
+        | sort -rV | head -1 | xargs -r dirname) || true
+
+    if [[ -n "$_sycl_lib" || -n "$_mkl_lib" ]]; then
+        oneapi_lib_line="export LD_LIBRARY_PATH=\"${_sycl_lib:+$_sycl_lib:}${_mkl_lib:+$_mkl_lib:}\${LD_LIBRARY_PATH:-}\"  # oneAPI runtime"
+        for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+            [[ -f "$rc" ]] || continue
+            if ! grep -q "oneAPI runtime" "$rc" 2>/dev/null; then
+                echo "" >> "$rc"
+                echo "$oneapi_lib_line" >> "$rc"
+                INFO "  Patched $rc with oneAPI LD_LIBRARY_PATH."
+            fi
+        done
+        # Apply to current session immediately
+        [[ -n "$_sycl_lib" ]] && export LD_LIBRARY_PATH="$_sycl_lib:${LD_LIBRARY_PATH:-}"
+        [[ -n "$_mkl_lib"  ]] && export LD_LIBRARY_PATH="$_mkl_lib:${LD_LIBRARY_PATH:-}"
+    fi
+
     echo ""
     OK "llama-cli and llama-server are now available system-wide."
     INFO "  Run: llama-cli --help"
@@ -498,14 +602,31 @@ build_engine() {
     current_gpu=$(detect_gpu)
     echo -e "${B_CYAN}Building AI Engine for $current_gpu...${NC}"
 
-    # Base Dependencies
+    # Base Dependencies — libdnnl-dev excluded for Intel: system libdnnl has no
+    # SYCL interop symbols (dnnl_sycl_interop_*) and cmake finds it regardless
+    # of cmake flags, causing linker failures. Intel SYCL builds use oneAPI dnnl.
+    local base_pkgs=(
+        pkg-config ca-certificates unzip file libfuse2
+        libwebkit2gtk-4.1-dev libgtk-3-dev gpg-agent
+        software-properties-common ocl-icd-libopencl1
+        build-essential git curl cmake
+        libcurl4-openssl-dev libssl-dev
+    )
+    if [[ "$current_gpu" != "INTEL" ]]; then
+        base_pkgs+=(libdnnl-dev)
+    fi
+
     sudo apt-get update -qq
-    sudo apt-get install -y --no-install-recommends \
-        pkg-config ca-certificates unzip file libfuse2 \
-        libwebkit2gtk-4.1-dev libgtk-3-dev gpg-agent \
-        software-properties-common ocl-icd-libopencl1 \
-        build-essential git curl cmake \
-        libdnnl-dev libcurl4-openssl-dev libssl-dev &>> "$LOG_FILE" || true
+    sudo apt-get install -y --no-install-recommends "${base_pkgs[@]}" &>> "$LOG_FILE" || true
+
+    # For Intel: remove system libdnnl if previously installed so cmake cannot
+    # find it. The oneAPI-bundled dnnl provides SYCL interop; the Ubuntu one does not.
+    if [[ "$current_gpu" == "INTEL" ]]; then
+        if dpkg -s libdnnl-dev &>/dev/null 2>&1; then
+            INFO "Removing system libdnnl-dev (incompatible with SYCL — using oneAPI dnnl)…"
+            sudo apt-get remove -y libdnnl-dev &>> "$LOG_FILE" || true
+        fi
+    fi
 
     OK "System packages installed."
 
@@ -550,13 +671,182 @@ build_engine() {
         "INTEL")
             install_intel_gpu_drivers
             echo "Optimizing for Intel Arc (SYCL)..." | tee -a "$LOG_FILE"
-            if source /opt/intel/oneapi/setvars.sh 2>/dev/null; then
-                echo "OneAPI environment loaded." | tee -a "$LOG_FILE"
-                cmake_flags+=("-DGGML_SYCL=ON")
+
+            # install_intel_gpu_drivers already sourced setvars.sh in this session.
+            # Do NOT source it again — setvars.sh writes to /dev/tty directly from
+            # sub-scripts, bypassing all stdout/stderr redirects and polluting output.
+            # Use find sorted by version (newest first) so an older leftover compiler
+            # installation never shadows a freshly upgraded one.
+            local ICX_PATH=""
+            ICX_PATH=$(command -v icx 2>/dev/null) || true
+            # If PATH still points to old version, force find newest by sort -rV
+            if [[ -n "$ICX_PATH" ]]; then
+                local icx_ver
+                icx_ver=$(echo "$ICX_PATH" | grep -oP '\d{4}(?=\.\d)' | head -1) || true
+                local newest_ver
+                newest_ver=$(find /opt/intel/oneapi/compiler -maxdepth 1 -mindepth 1 \
+                    -type d 2>/dev/null | grep -oP '\d{4}\.\d[\d.]*' | sort -rV | head -1) || true
+                # If PATH icx is older than what's installed, override with newest
+                if [[ -n "$newest_ver" && "$icx_ver" != "${newest_ver%%.*}" ]]; then
+                    ICX_PATH=$(find /opt/intel/oneapi/compiler/"$newest_ver"/bin \
+                        -name icx -type f 2>/dev/null | head -1) || true
+                fi
+            fi
+            # Fallback: find newest by sort -rV
+            if [[ -z "$ICX_PATH" ]]; then
+                ICX_PATH=$(find /opt/intel/oneapi/compiler -name icx -type f \
+                    2>/dev/null | sort -rV | head -1) || true
+            fi
+
+            if [[ -n "$ICX_PATH" ]]; then
+                # Ensure the compiler's bin dir is on PATH for cmake to find it
+                local icx_bin_dir
+                icx_bin_dir=$(dirname "$ICX_PATH")
+                export PATH="$icx_bin_dir:$PATH"
+                echo "OneAPI icx confirmed: $ICX_PATH" | tee -a "$LOG_FILE"
+
+                # CRITICAL: icpx (the SYCL-capable C++ compiler) must be set as
+                # CMAKE_CXX_COMPILER explicitly. Without this cmake picks up the
+                # system c++ (GCC), which doesn't know -fsycl and fails to compile
+                # every SYCL source file with "unrecognized command-line option".
+                local ICPX_PATH="$icx_bin_dir/icpx"
+                if [[ ! -f "$ICPX_PATH" ]]; then
+                    ICPX_PATH=$(find /opt/intel/oneapi -name icpx -type f 2>/dev/null | head -1) || true
+                fi
+
+                if [[ -z "$ICPX_PATH" ]]; then
+                    ERR "icpx not found alongside icx — oneAPI compiler install may be incomplete."
+                    read -rp "Continue anyway with CPU fallback? (y/n): " sycl_fallback
+                    [[ "${sycl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
+                else
+                    echo "icpx confirmed: $ICPX_PATH" | tee -a "$LOG_FILE"
+                    cmake_flags+=("-DGGML_SYCL=ON")
+                    cmake_flags+=("-DCMAKE_CXX_COMPILER=$ICPX_PATH")
+                    cmake_flags+=("-DCMAKE_C_COMPILER=$ICX_PATH")
+                fi
+
+                # Locate MKL cmake config — llama.cpp SYCL requires find_package(MKL).
+                # MKLConfig.cmake lives under the oneAPI MKL lib/cmake/mkl directory.
+                # Pass both MKL_DIR and CMAKE_PREFIX_PATH so cmake finds it regardless
+                # of whether the oneAPI environment is fully activated.
+                local MKL_CMAKE_DIR=""
+                MKL_CMAKE_DIR=$(find /opt/intel/oneapi/mkl -name "MKLConfig.cmake" \
+                    -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+
+                if [[ -n "$MKL_CMAKE_DIR" ]]; then
+                    cmake_flags+=("-DMKL_DIR=$MKL_CMAKE_DIR")
+                    cmake_flags+=("-DCMAKE_PREFIX_PATH=/opt/intel/oneapi/mkl/latest")
+                    echo "MKL cmake dir: $MKL_CMAKE_DIR" | tee -a "$LOG_FILE"
+                else
+                    WARN "MKLConfig.cmake not found — intel-oneapi-mkl-devel may not be installed."
+                    WARN "  Run: sudo apt-get install intel-oneapi-mkl-devel"
+                    WARN "  Then re-run Build AI Engine."
+                    read -rp "Continue anyway? cmake will likely fail. (y/n): " mkl_fallback
+                    [[ "${mkl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
+                fi
+
+                # Derive the compiler lib dir directly from the resolved ICX_PATH so
+                # it always matches the compiler version being used. Never use a bare
+                # find here — it may return a different (older) compiler version dir.
+                local ICX_VERSION_DIR
+                ICX_VERSION_DIR=$(dirname "$(dirname "$ICX_PATH")")  # .../compiler/2026.0
+                local ONEAPI_LIB_DIR="$ICX_VERSION_DIR/lib"
+                # Verify libsycl.so actually exists at this derived path
+                if [[ ! -f "$ONEAPI_LIB_DIR/libsycl.so" ]]; then
+                    # Try lib64 as fallback
+                    [[ -f "$ICX_VERSION_DIR/lib64/libsycl.so" ]] \
+                        && ONEAPI_LIB_DIR="$ICX_VERSION_DIR/lib64" \
+                        || { WARN "libsycl.so not found under $ICX_VERSION_DIR"; ONEAPI_LIB_DIR=""; }
+                fi
+                echo "SYCL lib dir: $ONEAPI_LIB_DIR" | tee -a "$LOG_FILE"
+
+                local MKL_LIB_DIR=""
+                MKL_LIB_DIR=$(find /opt/intel/oneapi/mkl -maxdepth 3 -name "libmkl_core.so" \
+                    -type f 2>/dev/null | sort -rV | head -1 | xargs -r dirname) || true
+
+                # TBB: find the versioned cmake config dir AND the lib dir.
+                # The cmake config lives at tbb/<ver>/lib/cmake/tbb/TBBConfig.cmake.
+                # The actual .so lives in tbb/<ver>/lib/intel64/gcc4.8/.
+                # Both must be correct for MKL's find_package(TBB) to succeed.
+                local TBB_ROOT=""
+                TBB_ROOT=$(find /opt/intel/oneapi/tbb -maxdepth 1 -mindepth 1 \
+                    -type d 2>/dev/null | sort -rV | head -1) || true
+                local TBB_CMAKE_DIR=""
+                local TBB_LIB_DIR=""
+                if [[ -n "$TBB_ROOT" ]]; then
+                    TBB_CMAKE_DIR=$(find "$TBB_ROOT" -name "TBBConfig.cmake" \
+                        -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+                    # Prefer the gcc4.8 subdir which is the universal ABI-stable path
+                    TBB_LIB_DIR=$(find "$TBB_ROOT/lib" -name "libtbb.so*" \
+                        -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+                fi
+                echo "TBB root: $TBB_ROOT | cmake: $TBB_CMAKE_DIR | lib: $TBB_LIB_DIR" \
+                    | tee -a "$LOG_FILE"
+
+                # ONEAPI_ROOT must be set in the environment for llama.cpp's cmake
+                # SYCL detection to confirm it's using the oneAPI release compiler
+                # rather than open-source clang++. Without it cmake warns and may
+                # select a different (slower or broken) code path.
+                local ONEAPI_ROOT_DIR
+                ONEAPI_ROOT_DIR=$(dirname "$(dirname "$ICX_VERSION_DIR")")  # .../oneapi
+                export ONEAPI_ROOT="$ONEAPI_ROOT_DIR"
+                echo "ONEAPI_ROOT: $ONEAPI_ROOT" | tee -a "$LOG_FILE"
+
+                # Tell cmake's linker where the oneAPI runtime shared libs live.
+                local oneapi_lib_paths=""
+                [[ -n "$ONEAPI_LIB_DIR" ]] && oneapi_lib_paths+="$ONEAPI_LIB_DIR;"
+                [[ -n "$MKL_LIB_DIR"    ]] && oneapi_lib_paths+="$MKL_LIB_DIR;"
+                [[ -n "$TBB_LIB_DIR"    ]] && oneapi_lib_paths+="$TBB_LIB_DIR;"
+                if [[ -n "$oneapi_lib_paths" ]]; then
+                    cmake_flags+=("-DCMAKE_LIBRARY_PATH=${oneapi_lib_paths%;}")
+                fi
+
+                # Pass TBB cmake config dir so MKL's find_package(TBB) succeeds
+                # and MKL::MKL_SYCL::BLAS target is created correctly.
+                if [[ -n "$TBB_CMAKE_DIR" ]]; then
+                    cmake_flags+=("-DTBB_DIR=$TBB_CMAKE_DIR")
+                else
+                    WARN "TBB cmake config not found — MKL::MKL_SYCL::BLAS may fail."
+                fi
+
+                # Bake rpaths into the binaries for runtime
+                local rpath_flags=""
+                [[ -n "$ONEAPI_LIB_DIR" ]] && rpath_flags+="-Wl,-rpath,$ONEAPI_LIB_DIR "
+                [[ -n "$MKL_LIB_DIR"    ]] && rpath_flags+="-Wl,-rpath,$MKL_LIB_DIR "
+                [[ -n "$TBB_LIB_DIR"    ]] && rpath_flags+="-Wl,-rpath,$TBB_LIB_DIR "
+                if [[ -n "$rpath_flags" ]]; then
+                    cmake_flags+=("-DCMAKE_SHARED_LINKER_FLAGS=${rpath_flags% }")
+                    cmake_flags+=("-DCMAKE_EXE_LINKER_FLAGS=${rpath_flags% }")
+                fi
+
+                # Locate oneAPI-bundled oneDNN (has SYCL interop symbols).
+                # The Ubuntu system libdnnl (libdnnl-dev) is SYCL-unaware and will
+                # produce "undefined reference to dnnl_sycl_interop_*" at link time.
+                local DNNL_CMAKE_DIR=""
+                DNNL_CMAKE_DIR=$(find /opt/intel/oneapi -name "dnnlConfig.cmake" \
+                    -o -name "oneapi-dnnl-config.cmake" -o -name "dnnl-config.cmake" \
+                    2>/dev/null | head -1 | xargs -r dirname) || true
+                if [[ -n "$DNNL_CMAKE_DIR" ]]; then
+                    cmake_flags+=("-Ddnnl_DIR=$DNNL_CMAKE_DIR")
+                    echo "oneAPI dnnl dir: $DNNL_CMAKE_DIR" | tee -a "$LOG_FILE"
+                else
+                    # Prevent cmake from finding and linking the system libdnnl which
+                    # lacks SYCL interop. CMAKE_DISABLE_FIND_PACKAGE_DNNL is the correct
+                    # cmake mechanism — it makes find_package(DNNL) always fail cleanly.
+                    cmake_flags+=("-DCMAKE_DISABLE_FIND_PACKAGE_DNNL=ON")
+                    cmake_flags+=("-DCMAKE_DISABLE_FIND_PACKAGE_oneDNN=ON")
+                    WARN "oneAPI dnnl not found — disabling oneDNN (DNNL/oneDNN find suppressed)."
+                fi
+
+                [[ -n "$ONEAPI_LIB_DIR" ]] && export LD_LIBRARY_PATH="$ONEAPI_LIB_DIR:${LD_LIBRARY_PATH:-}"
+                [[ -n "$MKL_LIB_DIR"    ]] && export LD_LIBRARY_PATH="$MKL_LIB_DIR:${LD_LIBRARY_PATH:-}"
+                [[ -n "$TBB_LIB_DIR"    ]] && export LD_LIBRARY_PATH="$TBB_LIB_DIR:${LD_LIBRARY_PATH:-}"
             else
-                echo -e "${B_RED}[!] Intel OneAPI not found. SYCL build will likely fail.${NC}" | tee -a "$LOG_FILE"
-                read -p "Continue anyway with CPU fallback? (y/n): " sycl_fallback
-                [[ "$sycl_fallback" != "y" ]] && { read -p "Press Enter..."; return; }
+                echo -e "${B_RED}[!] icx compiler not found. SYCL build will fail.${NC}" | tee -a "$LOG_FILE"
+                echo -e "${B_YELLOW}    Run: source /opt/intel/oneapi/setvars.sh --force${NC}"
+                echo -e "${B_YELLOW}    Then re-run Build AI Engine.${NC}"
+                read -rp "Continue anyway with CPU fallback? (y/n): " sycl_fallback
+                [[ "${sycl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
             fi
             ;;
         *)
@@ -786,18 +1076,18 @@ download_menu() {
 
 # NEW: Interactive context size picker
 select_context_size() {
+    local doubled=$(( context_size * 2 ))
     echo -e "\n${B_CYAN}Select Context Window Size:${NC}"
     echo "  1)  1024  tokens  (minimal RAM, very short conversations)"
     echo "  2)  2048  tokens"
     echo "  3)  4096  tokens"
-    echo "  4)  8192  tokens  (current default)"
+    echo "  4)  8192  tokens  (default)"
     echo "  5) 16384  tokens"
     echo "  6) 32768  tokens  (large RAM / VRAM required)"
-    echo "  7) Type a number manually"
-    # -r prevents backslash mangling; reading to a fresh variable avoids
-    # any stale input left in the terminal buffer by prior select loops.
+    echo "  7) Double current → ${doubled} tokens"
+    echo "  8) Type a number manually"
     local c=""
-    read -r -p "Select [1-7]: " c
+    read -r -p "Select [1-8] (current: ${context_size}): " c
     case $c in
         1) declare -g context_size=1024 ;;
         2) declare -g context_size=2048 ;;
@@ -805,7 +1095,8 @@ select_context_size() {
         4) declare -g context_size=8192 ;;
         5) declare -g context_size=16384 ;;
         6) declare -g context_size=32768 ;;
-        7)
+        7) declare -g context_size=$doubled ;;
+        8)
            local custom_ctx=""
            read -r -p "  Enter context size (min 512): " custom_ctx
            if [[ "$custom_ctx" =~ ^[0-9]+$ ]] && (( custom_ctx >= 512 )); then
@@ -1021,6 +1312,30 @@ chat_mode() {
     local current_gpu
     current_gpu=$(detect_gpu)
 
+    # ── Intel SYCL pre-flight: check render group membership ────────────
+    # SYCL requires access to /dev/dri/renderD128 which is owned by the
+    # 'render' group. Group changes only take effect after a full re-login.
+    # Detect this early and warn before launching rather than showing a
+    # cryptic "No device of requested type available" crash.
+    if [[ "$current_gpu" == "INTEL" ]]; then
+        if ! id -Gn 2>/dev/null | grep -qw "render"; then
+            echo -e ""
+            echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "${B_RED}║  ⚠  Intel GPU — 'render' group missing       ║${NC}"
+            echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+            echo -e "${B_RED}║${NC}  SYCL needs /dev/dri/render access.          ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  The build added you to 'render' but group   ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  membership needs a ${B_YELLOW}full log-out + log-in${NC}.   ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  After re-login, SYCL will find your GPU.    ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  To continue now with ${B_YELLOW}CPU fallback${NC}:          ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}    Select 0 GPU layers at the next prompt.   ${B_RED}║${NC}"
+            echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+            echo ""
+            read -rp "  Continue anyway? (y/n): " grp_cont
+            [[ "${grp_cont,,}" != "y" ]] && return
+        fi
+    fi
+
     local model
     model=$(select_model "Select model for chat [#]: ") || return
 
@@ -1032,24 +1347,65 @@ chat_mode() {
     echo -e "${B_YELLOW}  (Type /bye to quit or Ctrl+C to force exit)${NC}"
     echo -e "${B_YELLOW}  --no-context-shift: chat will STOP when context window is full${NC}"
 
+    # Capture stderr to a temp file so we can diagnose crash reasons.
+    # IMPORTANT: use a direct redirect (2>"$stderr_log") not process substitution
+    # (2> >(tee ...)) — process substitution is async and the file may be empty
+    # when we read it immediately after the command completes.
+    # SYCL_PI_TRACE was renamed to SYCL_UR_TRACE in oneAPI 2024+; set both to 0
+    # to suppress the GDB-on-exception behaviour in all oneAPI versions.
+    local stderr_log
+    stderr_log=$(mktemp /tmp/llama_chat_stderr.XXXXXX)
     local chat_exit=0
+
+    SYCL_PI_TRACE=0 \
+    SYCL_UR_TRACE=0 \
+    ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
     "$BUILD_DIR/bin/llama-cli" \
         -c "$context_size" \
         -m "$model" \
         -ngl "$ngl" \
         -cnv --prio 2 \
         --no-context-shift \
+        2>"$stderr_log" \
         || chat_exit=$?
+
+    # Always echo stderr to the terminal so the user sees live output,
+    # then use the captured file for diagnosis.
+    cat "$stderr_log" >&2
 
     if (( chat_exit != 0 )); then
         echo -e ""
-        echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${B_RED}║  Chat ended (exit code $chat_exit)$(printf '%*s' $((31 - ${#chat_exit})) '')║${NC}"
-        echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
-        echo -e "${B_RED}║${NC}  If the session ran long, the context window  ${B_RED}║${NC}"
-        echo -e "${B_RED}║${NC}  (${B_YELLOW}$context_size tokens${NC}) was likely full.$(printf '%*s' $((14 - ${#context_size})) '')${B_RED}║${NC}"
-        echo -e "${B_RED}║${NC}  Increase it in ${B_YELLOW}Settings → Context Size${NC}.     ${B_RED}║${NC}"
-        echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        local stderr_content
+        stderr_content=$(cat "$stderr_log" 2>/dev/null || true)
+        rm -f "$stderr_log"
+
+        if echo "$stderr_content" | grep -qi "No device of requested type\|no devices\|SYCL.*not found\|level.zero.*error"; then
+            echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "${B_RED}║  ✖  SYCL: No GPU device found (exit $chat_exit)$(printf '%*s' $((16 - ${#chat_exit})) '')║${NC}"
+            echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+            echo -e "${B_RED}║${NC}  The SYCL runtime could not see any GPU.     ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Most likely cause: not yet in 'render' group${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Fix: ${B_YELLOW}log out and log back in${NC}, then retry.  ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Or use ${B_YELLOW}0 GPU layers${NC} to run on CPU instead. ${B_RED}║${NC}"
+            echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        elif echo "$stderr_content" | grep -qi "context.shift\|context full\|KV cache\|kv.cache"; then
+            echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "${B_RED}║  Chat ended — context window full (exit $chat_exit)$(printf '%*s' $((7 - ${#chat_exit})) '')║${NC}"
+            echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+            echo -e "${B_RED}║${NC}  Context: ${B_YELLOW}$context_size tokens${NC} was exhausted.$(printf '%*s' $((12 - ${#context_size})) '')${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Increase it in ${B_YELLOW}Settings → Context Size${NC}.     ${B_RED}║${NC}"
+            echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        else
+            echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "${B_RED}║  Chat ended (exit code $chat_exit)$(printf '%*s' $((31 - ${#chat_exit})) '')║${NC}"
+            echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+            echo -e "${B_RED}║${NC}  Last error lines shown above. For full log: ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  use ${B_YELLOW}menu option 8${NC} → View Forensic Logs.    ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  If GPU layers > 0, try ${B_YELLOW}0 layers (CPU)${NC}.     ${B_RED}║${NC}"
+            echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        fi
+    else
+        rm -f "$stderr_log"
     fi
 
     read -p "Press Enter to return to menu..."
@@ -1089,23 +1445,77 @@ manage_server() {
     local current_gpu
     current_gpu=$(detect_gpu)
 
+    # Intel SYCL render group pre-check (same as chat_mode)
+    if [[ "$current_gpu" == "INTEL" ]]; then
+        if ! id -Gn 2>/dev/null | grep -qw "render"; then
+            WARN "Not in 'render' group — SYCL will crash at startup."
+            WARN "Log out and log back in, then restart the server."
+            WARN "Or set GPU layers to 0 to use CPU-only mode."
+            echo ""
+            read -rp "  Continue anyway? (y/n): " grp_srv
+            [[ "${grp_srv,,}" != "y" ]] && return
+        fi
+    fi
+
     local model
     model=$(select_model "Select model for server [#]: ") || return
 
     local ngl
     ngl=$(prompt_gpu_layers "$current_gpu")
 
-    # Generate self-signed cert if needed
+    # Generate self-signed cert with SAN entries — modern TLS clients (curl,
+    # browsers, Python requests) reject certs that only have CN and no SAN.
+    # Always regenerate if the existing cert is missing SANs.
     local cert_file="$INSTALL_DIR/server.crt"
     local key_file_ssl="$INSTALL_DIR/server.key"
-    if [[ ! -f "$cert_file" ]]; then
-        echo "Generating self-signed SSL certificate..."
-        openssl req -x509 -newkey rsa:2048 \
-            -keyout "$key_file_ssl" \
-            -out "$cert_file" \
-            -sha256 -days 365 -nodes \
-            -subj "/CN=llama.local" &> /dev/null \
-            || echo "Warning: Failed to generate SSL cert."
+    local use_ssl=1
+
+    echo ""
+    echo -e "  ${B_CYAN}Server mode:${NC}"
+    echo -e "  1) HTTPS (self-signed TLS — recommended, needs -k with curl)"
+    echo -e "  2) HTTP  (plain, no cert — easiest for local testing)"
+    local srvmode=""
+    read -r -p "  Select [1-2] (default: 1): " srvmode
+    [[ "$srvmode" == "2" ]] && use_ssl=0
+
+    if (( use_ssl )); then
+        # Determine all IPs to put in the SAN so the cert is valid for both
+        # localhost and LAN access without browser warnings
+        local lan_ip
+        lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [[ -z "$lan_ip" ]] && lan_ip=""
+
+        # Check if existing cert has a SAN — if not, regenerate it
+        local needs_regen=0
+        if [[ ! -f "$cert_file" ]]; then
+            needs_regen=1
+        elif ! openssl x509 -in "$cert_file" -noout -text 2>/dev/null \
+                | grep -q "Subject Alternative Name"; then
+            INFO "Existing cert has no SAN — regenerating with SAN support."
+            needs_regen=1
+        fi
+
+        if (( needs_regen )); then
+            echo "Generating self-signed SSL certificate with SAN…"
+            # Build the SAN string — always include localhost variants
+            local san_list="IP:127.0.0.1,DNS:localhost,DNS:llama.local"
+            [[ -n "$lan_ip" && "$lan_ip" != "127.0.0.1" ]] \
+                && san_list+=",IP:$lan_ip"
+            [[ "$visible2network" == "0.0.0.0" || \
+               ( -n "$visible2network" && \
+                 "$visible2network" != "127.0.0.1" && \
+                 "$visible2network" != "$lan_ip" ) ]] \
+                && san_list+=",IP:$visible2network" 2>/dev/null || true
+
+            openssl req -x509 -newkey rsa:2048 \
+                -keyout "$key_file_ssl" \
+                -out "$cert_file" \
+                -sha256 -days 365 -nodes \
+                -subj "/CN=llama.local" \
+                -addext "subjectAltName=$san_list" 2>/dev/null \
+                && OK "Certificate generated (SAN: $san_list)" \
+                || { echo "Warning: Failed to generate SSL cert — falling back to HTTP."; use_ssl=0; }
+        fi
     fi
 
     local api_key
@@ -1116,9 +1526,7 @@ manage_server() {
         *)           api_key=$(openssl rand -hex 12) ;;   # fallback
     esac
 
-    # FIX: Derive the display URL from the actual bind address.
-    # If bound to 0.0.0.0 show the LAN IP; otherwise show exactly what
-    # the server is listening on so the URL is always reachable.
+    # Derive display URL
     local display_ip
     if [[ "$visible2network" == "0.0.0.0" ]]; then
         display_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
@@ -1126,27 +1534,37 @@ manage_server() {
     else
         display_ip="$visible2network"
     fi
-    local server_url="https://${display_ip}:${network_port}"
+    local scheme="http"
+    (( use_ssl )) && scheme="https"
+    local server_url="${scheme}://${display_ip}:${network_port}"
 
-    # FIX: Use --ctx-size (llama-server flag); -c is llama-cli only in
-    #      recent llama.cpp builds and is silently ignored by the server.
-    "$BUILD_DIR/bin/llama-server" \
-        -m "$model" \
-        -ngl "$ngl" \
-        --ctx-size "$context_size" \
-        --host "$visible2network" \
-        --port "$network_port" \
-        --ssl-key-file "$key_file_ssl" \
-        --ssl-cert-file "$cert_file" \
-        --api-key "$api_key" \
+    # Build server command — SSL flags only when use_ssl=1
+    local server_cmd=(
+        "$BUILD_DIR/bin/llama-server"
+        -m "$model"
+        -ngl "$ngl"
+        --ctx-size "$context_size"
+        --host "$visible2network"
+        --port "$network_port"
+        --api-key "$api_key"
+    )
+    if (( use_ssl )); then
+        server_cmd+=(--ssl-key-file "$key_file_ssl" --ssl-cert-file "$cert_file")
+    fi
+
+    SYCL_PI_TRACE=0 \
+    SYCL_UR_TRACE=0 \
+    ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
+    "${server_cmd[@]}" \
         > "$INSTALL_DIR/server.log" 2>&1 &
 
     local server_pid=$!
     echo "$server_pid" > "$SERVER_PID_FILE"
 
-    # Wait up to 4 s for the server to confirm it started
+    # llama-server logs "listening" (not "HTTP server listening") in recent builds.
+    # Wait up to 8 s, checking for any of the known startup messages.
     local started=0
-    for _ in 1 2 3 4; do
+    for _ in 1 2 3 4 5 6 7 8; do
         sleep 1
         if ! ps -p "$server_pid" > /dev/null 2>&1; then
             echo -e "\n${B_RED}✖ Server process died immediately. Check logs:${NC}"
@@ -1156,10 +1574,11 @@ manage_server() {
             read -p "Press Enter to return..."
             return 1
         fi
-        grep -q "HTTP server listening" "$INSTALL_DIR/server.log" 2>/dev/null && { started=1; break; }
+        grep -qiE "listening|server started|all slots are idle" \
+            "$INSTALL_DIR/server.log" 2>/dev/null && { started=1; break; }
     done
 
-    # Persist connection info for the status display (readable by main loop)
+    # Persist connection info for the status display
     {
         echo -e "  ${B_GREEN}URL  :${NC} ${B_CYAN}${server_url}${NC}"
         echo -e "  ${B_GREEN}Key  :${NC} ${B_YELLOW}${api_key}${NC}"
@@ -1167,9 +1586,12 @@ manage_server() {
     } > "$SERVER_INFO_FILE"
     chmod 600 "$SERVER_INFO_FILE" 2>/dev/null || true
 
-    # Persist to the audit log
+    # Audit log
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] PID=$server_pid | $(basename "$model") | ngl=$ngl | ctx=$context_size | bind=$visible2network | url=$server_url | key=$api_key" >> "$KEY_FILE"
     chmod 600 "$KEY_FILE" 2>/dev/null || true
+
+    local ssl_note=""
+    (( use_ssl )) && ssl_note=" (use -k with curl to accept self-signed cert)"
 
     echo -e ""
     echo -e "${B_GREEN}╔══════════════════════════════════════════════╗${NC}"
@@ -1178,19 +1600,109 @@ manage_server() {
     printf "${B_GREEN}║${NC}  %-12s ${B_CYAN}%-31s${NC} ${B_GREEN}║${NC}\n" "URL:" "$server_url"
     printf "${B_GREEN}║${NC}  %-12s ${B_YELLOW}%-31s${NC} ${B_GREEN}║${NC}\n" "API Key:" "$api_key"
     printf "${B_GREEN}║${NC}  %-12s %-31s ${B_GREEN}║${NC}\n" "Context:" "${context_size} tokens"
-    printf "${B_GREEN}║${NC}  %-12s %-31s ${B_GREEN}║${NC}\n" "Bind addr:" "$visible2network:$network_port"
+    printf "${B_GREEN}║${NC}  %-12s %-31s ${B_GREEN}║${NC}\n" "Bind:" "$visible2network:$network_port"
+    printf "${B_GREEN}║${NC}  %-12s %-31s ${B_GREEN}║${NC}\n" "TLS:" "$(( use_ssl )) && echo 'HTTPS self-signed' || echo 'HTTP plain'"
     [[ $started -eq 0 ]] && \
     printf "${B_YELLOW}║${NC}  %-44s ${B_YELLOW}║${NC}\n" "⚠  Startup not confirmed yet — check logs"
     echo -e "${B_GREEN}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${B_CYAN}Quick test:${NC}"
+    if (( use_ssl )); then
+        echo -e "  curl -sk ${server_url}/health -H \"Authorization: Bearer ${api_key}\""
+    else
+        echo -e "  curl -s ${server_url}/health -H \"Authorization: Bearer ${api_key}\""
+    fi
+    echo -e "  ${B_YELLOW}Note: For network access set binding to 0.0.0.0 in Settings${NC}${ssl_note}"
+    echo ""
     echo -e "   Logs: $INSTALL_DIR/server.log"
     echo -e "   Keys: $KEY_FILE"
-    echo -e "   Note: Accept the self-signed cert warning in your browser."
     read -p "Press Enter to return..."
 }
 
 # ================================================================
-#  MAIN LOOP
+#  LLAMA.CPP UPDATE CHECKER
+#  Checks the current branch against its upstream remote and shows
+#  a summary of new commits. Optionally pulls and rebuilds.
 # ================================================================
+# ================================================================
+#  SCRIPT UPDATE CHECKER
+#  Compares llama_manager.sh against the version in the GitHub repo
+#  and offers to pull the latest copy in-place.
+# ================================================================
+check_for_updates() {
+    draw_header
+    echo -e "${B_CYAN}[ 🔄  LLAMA MANAGER UPDATE CHECK ]${NC}"
+    echo ""
+
+    local REPO_RAW="https://raw.githubusercontent.com/MasterMould/gguf-gasket/main/llama_manager.sh"
+    local SCRIPT_PATH
+    SCRIPT_PATH="$(realpath "$0")" || SCRIPT_PATH="$0"
+
+    echo -e "  Checking ${B_CYAN}${REPO_RAW}${NC}…"
+    echo ""
+
+    local remote_content
+    if ! remote_content=$(curl -fsSL "$REPO_RAW" 2>/dev/null); then
+        ERR "Could not reach GitHub. Check your network connection."
+        read -p "Press Enter to return..."
+        return
+    fi
+
+    # Extract version strings from local and remote scripts
+    local local_ver remote_ver
+    local_ver=$(grep -m1 'LLAMA COMMAND CENTER' "$SCRIPT_PATH" 2>/dev/null \
+        | grep -oP 'v[\d.]+' | head -1 || echo "unknown")
+    remote_ver=$(echo "$remote_content" \
+        | grep -m1 'LLAMA COMMAND CENTER' \
+        | grep -oP 'v[\d.]+' | head -1 || echo "unknown")
+
+    echo -e "  Installed : ${B_YELLOW}${local_ver}${NC}"
+    echo -e "  Available : ${B_YELLOW}${remote_ver}${NC}"
+    echo ""
+
+    # Quick diff — count changed lines
+    local changed_lines
+    changed_lines=$(diff <(cat "$SCRIPT_PATH") <(echo "$remote_content") \
+        | grep -c '^[<>]' 2>/dev/null || echo 0)
+
+    if (( changed_lines == 0 )); then
+        OK "Script is identical to the repository — no update needed."
+        echo ""
+        read -p "Press Enter to return..."
+        return
+    fi
+
+    echo -e "  ${B_GREEN}Update available — ${changed_lines} line(s) differ from GitHub.${NC}"
+    echo ""
+
+    # Show a compact diff summary (first 30 changed lines)
+    diff --unified=0 <(cat "$SCRIPT_PATH") <(echo "$remote_content") 2>/dev/null \
+        | grep -E '^[+-]' | grep -v '^[+-]{3}' | head -30 \
+        | sed 's/^+/  + /; s/^-/  - /'
+    echo ""
+
+    read -rp "  Update llama_manager.sh to the latest version? (y/n): " do_update
+    if [[ "${do_update,,}" != "y" ]]; then
+        echo "  Skipped."
+        sleep 1; return
+    fi
+
+    # Backup current script before overwriting
+    local backup="${SCRIPT_PATH}.bak.$(date +%Y%m%d_%H%M%S)"
+    cp "$SCRIPT_PATH" "$backup" || { ERR "Could not create backup at $backup."; return 1; }
+    OK "Backup saved: $backup"
+
+    # Write new version
+    echo "$remote_content" > "$SCRIPT_PATH" \
+        && chmod +x "$SCRIPT_PATH" \
+        || { ERR "Failed to write update — restoring backup."; cp "$backup" "$SCRIPT_PATH"; return 1; }
+
+    OK "Update applied. Restarting script…"
+    sleep 1
+    exec "$SCRIPT_PATH"
+}
+
+
 rotate_log
 
 while true; do
@@ -1233,9 +1745,10 @@ while true; do
     echo -e "4) ${B_GREEN}Start / Stop Web Server${NC}"
     echo -e "5) ${B_YELLOW}⚙  Settings${NC}          (Context, Port, Network)"
     echo -e "6) ${B_RED}DEEP REPAIR${NC}         (Fix Drivers/Conflicts)"
-    echo -e "7) View Forensic Logs"
-    echo -e "8) View Saved API Keys"
-    echo -e "9) Exit"
+    echo -e "7) 🔄 Check for llama.cpp Updates"
+    echo -e "8) View Forensic Logs"
+    echo -e "9) View Saved API Keys"
+    echo -e "0) Exit"
     read -p "Action: " choice
 
     case $choice in
@@ -1245,19 +1758,20 @@ while true; do
         4) manage_server ;;
         5) settings_menu ;;
         6) deep_repair ;;
-        7)
+        7) check_for_updates ;;
+        8)
             draw_header
             echo -e "${B_CYAN}--- Last 50 lines of $LOG_FILE ---${NC}"
             tail -n 50 "$LOG_FILE" 2>/dev/null || echo "(Log file is empty or missing)"
             read -p "Press Enter to return..."
             ;;
-        8)
+        9)
             draw_header
             echo -e "${B_CYAN}--- Saved API Keys ($KEY_FILE) ---${NC}"
             cat "$KEY_FILE" 2>/dev/null || echo "(No keys saved yet)"
             read -p "Press Enter to return..."
             ;;
-        9) echo -e "${B_CYAN}Goodbye!${NC}"; exit 0 ;;
+        0) echo -e "${B_CYAN}Goodbye!${NC}"; exit 0 ;;
         *) echo -e "${B_RED}Invalid option.${NC}"; sleep 1 ;;
     esac
 done
