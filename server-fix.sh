@@ -208,8 +208,8 @@ install_Nvidia_gpu_drivers() {
 install_AMD_gpu_drivers() {
     STEP "Installing AMD / Vulkan dependencies…"
     sudo apt-get install -y \
-        libnuma-dev libvulkan-dev wget vulkan-tools \
-        glslang-tools gnupg2 &>> "$LOG_FILE" || true
+        libnuma-dev spirv-headers libvulkan-dev wget glsc glslang-dev vulkan-tools \
+        vulkan-headers libvulk mesa-vulkan-drivers glslang-tools gnupg2 &>> "$LOG_FILE" || true
     # Note: libvulkan-dev:i386 requires multiarch; install separately if needed.
     sudo dpkg --add-architecture i386 2>/dev/null || true
     sudo apt-get update -qq &>> "$LOG_FILE" || true
