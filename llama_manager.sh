@@ -87,7 +87,7 @@ rotate_log() {
 
 draw_header() {
     echo -e "${CLEAR}${B_CYAN}======================================================"
-    echo -e "           🦙 LLAMA COMMAND CENTER (v8.2) 🦙"
+    echo -e "           🦙 LLAMA COMMAND CENTER (v8.3) 🦙"
     echo -e "           * Universal GPU & Repair Mode *"
     echo -e "======================================================${NC}"
 }
@@ -208,8 +208,8 @@ install_Nvidia_gpu_drivers() {
 install_AMD_gpu_drivers() {
     STEP "Installing AMD / Vulkan dependencies…"
     sudo apt-get install -y \
-        libnuma-dev libvulkan-dev wget vulkan-tools \
-        glslang-tools gnupg2 &>> "$LOG_FILE" || true
+        libnuma-dev spirv-headers libvulkan libvulkan1 linux-modules-extra-$(uname -r) libvulkan-dev wget glsc glslang-dev vulkan-tools \
+        vulkan-headers libvulk mesa-vulkan-drivers mesa-vulkan-drivers:i386 mesa-utils glslang-tools gnupg2 &>> "$LOG_FILE" || true
     # Note: libvulkan-dev:i386 requires multiarch; install separately if needed.
     sudo dpkg --add-architecture i386 2>/dev/null || true
     sudo apt-get update -qq &>> "$LOG_FILE" || true
@@ -763,14 +763,36 @@ build_engine() {
                 local MKL_LIB_DIR=""
                 MKL_LIB_DIR=$(find /opt/intel/oneapi/mkl -maxdepth 3 -name "libmkl_core.so" \
                     -type f 2>/dev/null | sort -rV | head -1 | xargs -r dirname) || true
+
+                # TBB: find the versioned cmake config dir AND the lib dir.
+                # The cmake config lives at tbb/<ver>/lib/cmake/tbb/TBBConfig.cmake.
+                # The actual .so lives in tbb/<ver>/lib/intel64/gcc4.8/.
+                # Both must be correct for MKL's find_package(TBB) to succeed.
+                local TBB_ROOT=""
+                TBB_ROOT=$(find /opt/intel/oneapi/tbb -maxdepth 1 -mindepth 1 \
+                    -type d 2>/dev/null | sort -rV | head -1) || true
+                local TBB_CMAKE_DIR=""
                 local TBB_LIB_DIR=""
-                TBB_LIB_DIR=$(find /opt/intel/oneapi/tbb -name "libtbb.so*" \
-                    -type f 2>/dev/null | sort -rV | head -1 | xargs -r dirname) || true
+                if [[ -n "$TBB_ROOT" ]]; then
+                    TBB_CMAKE_DIR=$(find "$TBB_ROOT" -name "TBBConfig.cmake" \
+                        -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+                    # Prefer the gcc4.8 subdir which is the universal ABI-stable path
+                    TBB_LIB_DIR=$(find "$TBB_ROOT/lib" -name "libtbb.so*" \
+                        -type f 2>/dev/null | head -1 | xargs -r dirname) || true
+                fi
+                echo "TBB root: $TBB_ROOT | cmake: $TBB_CMAKE_DIR | lib: $TBB_LIB_DIR" \
+                    | tee -a "$LOG_FILE"
+
+                # ONEAPI_ROOT must be set in the environment for llama.cpp's cmake
+                # SYCL detection to confirm it's using the oneAPI release compiler
+                # rather than open-source clang++. Without it cmake warns and may
+                # select a different (slower or broken) code path.
+                local ONEAPI_ROOT_DIR
+                ONEAPI_ROOT_DIR=$(dirname "$(dirname "$ICX_VERSION_DIR")")  # .../oneapi
+                export ONEAPI_ROOT="$ONEAPI_ROOT_DIR"
+                echo "ONEAPI_ROOT: $ONEAPI_ROOT" | tee -a "$LOG_FILE"
 
                 # Tell cmake's linker where the oneAPI runtime shared libs live.
-                # CMAKE_LIBRARY_PATH is the correct mechanism — it extends the
-                # linker search path so libsycl.so, libmkl_*.so, libtbb.so are
-                # found without needing setvars or manual -rpath injection.
                 local oneapi_lib_paths=""
                 [[ -n "$ONEAPI_LIB_DIR" ]] && oneapi_lib_paths+="$ONEAPI_LIB_DIR;"
                 [[ -n "$MKL_LIB_DIR"    ]] && oneapi_lib_paths+="$MKL_LIB_DIR;"
@@ -779,8 +801,15 @@ build_engine() {
                     cmake_flags+=("-DCMAKE_LIBRARY_PATH=${oneapi_lib_paths%;}")
                 fi
 
-                # Also bake rpaths into the binaries for runtime (no need to set
-                # LD_LIBRARY_PATH manually when running llama-server from a terminal).
+                # Pass TBB cmake config dir so MKL's find_package(TBB) succeeds
+                # and MKL::MKL_SYCL::BLAS target is created correctly.
+                if [[ -n "$TBB_CMAKE_DIR" ]]; then
+                    cmake_flags+=("-DTBB_DIR=$TBB_CMAKE_DIR")
+                else
+                    WARN "TBB cmake config not found — MKL::MKL_SYCL::BLAS may fail."
+                fi
+
+                # Bake rpaths into the binaries for runtime
                 local rpath_flags=""
                 [[ -n "$ONEAPI_LIB_DIR" ]] && rpath_flags+="-Wl,-rpath,$ONEAPI_LIB_DIR "
                 [[ -n "$MKL_LIB_DIR"    ]] && rpath_flags+="-Wl,-rpath,$MKL_LIB_DIR "
@@ -1434,17 +1463,59 @@ manage_server() {
     local ngl
     ngl=$(prompt_gpu_layers "$current_gpu")
 
-    # Generate self-signed cert if needed
+    # Generate self-signed cert with SAN entries — modern TLS clients (curl,
+    # browsers, Python requests) reject certs that only have CN and no SAN.
+    # Always regenerate if the existing cert is missing SANs.
     local cert_file="$INSTALL_DIR/server.crt"
     local key_file_ssl="$INSTALL_DIR/server.key"
-    if [[ ! -f "$cert_file" ]]; then
-        echo "Generating self-signed SSL certificate..."
-        openssl req -x509 -newkey rsa:2048 \
-            -keyout "$key_file_ssl" \
-            -out "$cert_file" \
-            -sha256 -days 365 -nodes \
-            -subj "/CN=llama.local" &> /dev/null \
-            || echo "Warning: Failed to generate SSL cert."
+    local use_ssl=1
+
+    echo ""
+    echo -e "  ${B_CYAN}Server mode:${NC}"
+    echo -e "  1) HTTPS (self-signed TLS — recommended, needs -k with curl)"
+    echo -e "  2) HTTP  (plain, no cert — easiest for local testing)"
+    local srvmode=""
+    read -r -p "  Select [1-2] (default: 1): " srvmode
+    [[ "$srvmode" == "2" ]] && use_ssl=0
+
+    if (( use_ssl )); then
+        # Determine all IPs to put in the SAN so the cert is valid for both
+        # localhost and LAN access without browser warnings
+        local lan_ip
+        lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [[ -z "$lan_ip" ]] && lan_ip=""
+
+        # Check if existing cert has a SAN — if not, regenerate it
+        local needs_regen=0
+        if [[ ! -f "$cert_file" ]]; then
+            needs_regen=1
+        elif ! openssl x509 -in "$cert_file" -noout -text 2>/dev/null \
+                | grep -q "Subject Alternative Name"; then
+            INFO "Existing cert has no SAN — regenerating with SAN support."
+            needs_regen=1
+        fi
+
+        if (( needs_regen )); then
+            echo "Generating self-signed SSL certificate with SAN…"
+            # Build the SAN string — always include localhost variants
+            local san_list="IP:127.0.0.1,DNS:localhost,DNS:llama.local"
+            [[ -n "$lan_ip" && "$lan_ip" != "127.0.0.1" ]] \
+                && san_list+=",IP:$lan_ip"
+            [[ "$visible2network" == "0.0.0.0" || \
+               ( -n "$visible2network" && \
+                 "$visible2network" != "127.0.0.1" && \
+                 "$visible2network" != "$lan_ip" ) ]] \
+                && san_list+=",IP:$visible2network" 2>/dev/null || true
+
+            openssl req -x509 -newkey rsa:2048 \
+                -keyout "$key_file_ssl" \
+                -out "$cert_file" \
+                -sha256 -days 365 -nodes \
+                -subj "/CN=llama.local" \
+                -addext "subjectAltName=$san_list" 2>/dev/null \
+                && OK "Certificate generated (SAN: $san_list)" \
+                || { echo "Warning: Failed to generate SSL cert — falling back to HTTP."; use_ssl=0; }
+        fi
     fi
 
     local api_key
@@ -1455,9 +1526,7 @@ manage_server() {
         *)           api_key=$(openssl rand -hex 12) ;;   # fallback
     esac
 
-    # FIX: Derive the display URL from the actual bind address.
-    # If bound to 0.0.0.0 show the LAN IP; otherwise show exactly what
-    # the server is listening on so the URL is always reachable.
+    # Derive display URL
     local display_ip
     if [[ "$visible2network" == "0.0.0.0" ]]; then
         display_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
@@ -1465,30 +1534,37 @@ manage_server() {
     else
         display_ip="$visible2network"
     fi
-    local server_url="https://${display_ip}:${network_port}"
+    local scheme="http"
+    (( use_ssl )) && scheme="https"
+    local server_url="${scheme}://${display_ip}:${network_port}"
 
-    # FIX: Use --ctx-size (llama-server flag); -c is llama-cli only in
-    #      recent llama.cpp builds and is silently ignored by the server.
+    # Build server command — SSL flags only when use_ssl=1
+    local server_cmd=(
+        "$BUILD_DIR/bin/llama-server"
+        -m "$model"
+        -ngl "$ngl"
+        --ctx-size "$context_size"
+        --host "$visible2network"
+        --port "$network_port"
+        --api-key "$api_key"
+    )
+    if (( use_ssl )); then
+        server_cmd+=(--ssl-key-file "$key_file_ssl" --ssl-cert-file "$cert_file")
+    fi
+
     SYCL_PI_TRACE=0 \
     SYCL_UR_TRACE=0 \
     ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
-    "$BUILD_DIR/bin/llama-server" \
-        -m "$model" \
-        -ngl "$ngl" \
-        --ctx-size "$context_size" \
-        --host "$visible2network" \
-        --port "$network_port" \
-        --ssl-key-file "$key_file_ssl" \
-        --ssl-cert-file "$cert_file" \
-        --api-key "$api_key" \
+    "${server_cmd[@]}" \
         > "$INSTALL_DIR/server.log" 2>&1 &
 
     local server_pid=$!
     echo "$server_pid" > "$SERVER_PID_FILE"
 
-    # Wait up to 4 s for the server to confirm it started
+    # llama-server logs "listening" (not "HTTP server listening") in recent builds.
+    # Wait up to 8 s, checking for any of the known startup messages.
     local started=0
-    for _ in 1 2 3 4; do
+    for _ in 1 2 3 4 5 6 7 8; do
         sleep 1
         if ! ps -p "$server_pid" > /dev/null 2>&1; then
             echo -e "\n${B_RED}✖ Server process died immediately. Check logs:${NC}"
@@ -1498,10 +1574,11 @@ manage_server() {
             read -p "Press Enter to return..."
             return 1
         fi
-        grep -q "HTTP server listening" "$INSTALL_DIR/server.log" 2>/dev/null && { started=1; break; }
+        grep -qiE "listening|server started|all slots are idle" \
+            "$INSTALL_DIR/server.log" 2>/dev/null && { started=1; break; }
     done
 
-    # Persist connection info for the status display (readable by main loop)
+    # Persist connection info for the status display
     {
         echo -e "  ${B_GREEN}URL  :${NC} ${B_CYAN}${server_url}${NC}"
         echo -e "  ${B_GREEN}Key  :${NC} ${B_YELLOW}${api_key}${NC}"
@@ -1509,9 +1586,12 @@ manage_server() {
     } > "$SERVER_INFO_FILE"
     chmod 600 "$SERVER_INFO_FILE" 2>/dev/null || true
 
-    # Persist to the audit log
+    # Audit log
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] PID=$server_pid | $(basename "$model") | ngl=$ngl | ctx=$context_size | bind=$visible2network | url=$server_url | key=$api_key" >> "$KEY_FILE"
     chmod 600 "$KEY_FILE" 2>/dev/null || true
+
+    local ssl_note=""
+    (( use_ssl )) && ssl_note=" (use -k with curl to accept self-signed cert)"
 
     echo -e ""
     echo -e "${B_GREEN}╔══════════════════════════════════════════════╗${NC}"
@@ -1520,13 +1600,22 @@ manage_server() {
     printf "${B_GREEN}║${NC}  %-12s ${B_CYAN}%-31s${NC} ${B_GREEN}║${NC}\n" "URL:" "$server_url"
     printf "${B_GREEN}║${NC}  %-12s ${B_YELLOW}%-31s${NC} ${B_GREEN}║${NC}\n" "API Key:" "$api_key"
     printf "${B_GREEN}║${NC}  %-12s %-31s ${B_GREEN}║${NC}\n" "Context:" "${context_size} tokens"
-    printf "${B_GREEN}║${NC}  %-12s %-31s ${B_GREEN}║${NC}\n" "Bind addr:" "$visible2network:$network_port"
+    printf "${B_GREEN}║${NC}  %-12s %-31s ${B_GREEN}║${NC}\n" "Bind:" "$visible2network:$network_port"
+    printf "${B_GREEN}║${NC}  %-12s %-31s ${B_GREEN}║${NC}\n" "TLS:" "$(( use_ssl )) && echo 'HTTPS self-signed' || echo 'HTTP plain'"
     [[ $started -eq 0 ]] && \
     printf "${B_YELLOW}║${NC}  %-44s ${B_YELLOW}║${NC}\n" "⚠  Startup not confirmed yet — check logs"
     echo -e "${B_GREEN}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${B_CYAN}Quick test:${NC}"
+    if (( use_ssl )); then
+        echo -e "  curl -sk ${server_url}/health -H \"Authorization: Bearer ${api_key}\""
+    else
+        echo -e "  curl -s ${server_url}/health -H \"Authorization: Bearer ${api_key}\""
+    fi
+    echo -e "  ${B_YELLOW}Note: For network access set binding to 0.0.0.0 in Settings${NC}${ssl_note}"
+    echo ""
     echo -e "   Logs: $INSTALL_DIR/server.log"
     echo -e "   Keys: $KEY_FILE"
-    echo -e "   Note: Accept the self-signed cert warning in your browser."
     read -p "Press Enter to return..."
 }
 
