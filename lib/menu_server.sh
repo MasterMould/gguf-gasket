@@ -143,7 +143,6 @@ manage_server() {
     (( use_ssl )) && \
         server_cmd+=(--ssl-key-file "$key_file_ssl" --ssl-cert-file "$cert_file")
 
-    SYCL_PI_TRACE=0 \
     SYCL_UR_TRACE=0 \
     ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
     "${server_cmd[@]}" \
