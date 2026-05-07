@@ -128,7 +128,6 @@ chat_mode() {
     stderr_log=$(mktemp /tmp/llama_chat_stderr.XXXXXX)
     local chat_exit=0
 
-    SYCL_PI_TRACE=0 \
     SYCL_UR_TRACE=0 \
     ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
     "$BUILD_DIR/bin/llama-cli" \
