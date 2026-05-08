@@ -14,23 +14,23 @@ select_context_size() {
     local doubled=$(( context_size * 2 ))
     echo -e "
 ${B_CYAN}Select Context Window Size:${NC}"
-    echo "  1)  1024  tokens  (minimal RAM, very short conversations)"
-    echo "  2)  2048  tokens"
-    echo "  3)  4096  tokens"
-    echo "  4)  8192  tokens  (default)"
-    echo "  5) 16384  tokens"
-    echo "  6) 32768  tokens  (large RAM / VRAM required)"
+    echo "  1) 4096 tokens  (minimal RAM, very short conversations)"
+    echo "  2) 8192 tokens  (default)"
+    echo "  3) 16384 tokens"
+    echo "  4) 32768 tokens"
+    echo "  5) 65536 tokens"
+    echo "  6) 131072 tokens  (large RAM / VRAM required)"
     echo "  7) Double current → ${doubled} tokens"
     echo "  8) Type a number manually"
     local c=""
     read -r -p "Select [1-8] (current: ${context_size}): " c
     case $c in
-        1) declare -g context_size=1024 ;;
-        2) declare -g context_size=2048 ;;
-        3) declare -g context_size=4096 ;;
-        4) declare -g context_size=8192 ;;
-        5) declare -g context_size=16384 ;;
-        6) declare -g context_size=32768 ;;
+        1) declare -g context_size=4096 ;;
+        2) declare -g context_size=8192 ;;
+        3) declare -g context_size=16384 ;;
+        4) declare -g context_size=32768 ;;
+        5) declare -g context_size=65536 ;;
+        6) declare -g context_size=131072 ;;
         7) declare -g context_size=$doubled ;;
         8)
            local custom_ctx=""
@@ -41,7 +41,7 @@ ${B_CYAN}Select Context Window Size:${NC}"
                WARN "Invalid value — must be a number ≥ 512. Unchanged."; sleep 1; return
            fi
            ;;
-        *) WARN "Invalid selection. Unchanged."; sleep 1; return ;;
+        *) WARN "Invalid selection. Context size unchanged...."; sleep 2; return ;;
     esac
     save_settings
     OK "Context size set to $context_size tokens."
@@ -60,8 +60,8 @@ ${B_CYAN}Select API Key Mode:${NC}"
     read -r -p "  Select [1-3]: " a
     case $a in
         1) declare -g api_key_mode="random" ;;
-        2) declare -g api_key_mode="localtest"
-           WARN "Key 'localtest' is predictable — only use on localhost." ;;
+        2) declare -g api_key_mode="local-test"
+           WARN "Key 'local-test' is predictable — only use on localhost." ;;
         3)
            local custom_key=""
            read -r -p "  Enter API key (min 8 chars): " custom_key
