@@ -1,6 +1,6 @@
 #!/bin/bash
 # Menu module — auto-discovered by llama_manager.sh
-MENU_LABEL="mem0 — DEVELOPING"
+MENU_LABEL="mem0 — Persistent AI Memory"
 MENU_FN="mem0_menu"
 MENU_COLOR='${B_CYAN}'
 MENU_ORDER=82
@@ -51,11 +51,15 @@ _mem0_status() {
     fi
 
     if [[ -f "$MEM0_CONFIG" ]]; then
-        local backend
+        local backend embedder
         backend=$(python3 -c "import json,sys; d=json.load(open('$MEM0_CONFIG')); \
             print(d.get('vector_store',{}).get('provider','unknown'))" 2>/dev/null \
             || echo "unknown")
+        embedder=$(python3 -c "import json,sys; d=json.load(open('$MEM0_CONFIG')); \
+            print(d.get('embedder',{}).get('provider','unknown'))" 2>/dev/null \
+            || echo "unknown")
         echo -e "    Backend  : ${B_YELLOW}${backend}${NC}"
+        echo -e "    Embedder : ${B_YELLOW}${embedder}${NC}"
         echo -e "    Config   : $MEM0_CONFIG"
     else
         echo -e "    Config   : ${B_YELLOW}not configured${NC}"
@@ -90,6 +94,7 @@ _mem0_install() {
     echo "    $MEM0_VENV"
     echo ""
     echo "  Default vector store: Chroma (local, no extra services needed)"
+    echo "  Default embedder: Ollama nomic-embed-text (recommended)"
     echo "  Optional: Qdrant (requires Docker — configure after install)"
     echo ""
     echo "  Python 3.9+ required. Checking…"
@@ -230,7 +235,7 @@ _mem0_configure() {
     echo "  Current config: $MEM0_CONFIG"
     echo ""
     echo "  1) Set llama-server URL and API key"
-    echo "  2) Switch vector store backend"
+    echo "  2) Switch embedder backend"
     echo "  3) View / edit raw config (nano)"
     echo "  4) Reset to defaults"
     echo "  5) Back"
@@ -419,23 +424,53 @@ def load_mem0():
 
 def cmd_add(m, role, content, user_id="default_user"):
     result = m.add([{"role": role, "content": content}], user_id=user_id)
-    print(f"Added {len(result)} memory entries.")
+    count = len(result) if isinstance(result, list) else (
+        len(result.get("results", [])) if isinstance(result, dict) else 1
+    )
+    print(f"Added {count} memory entry/entries.")
 
 def cmd_search(m, query, user_id="default_user"):
-    results = m.search(query, user_id=user_id)
+    # Try new API first (filters=), fall back to old API (user_id=)
+    try:
+        results = m.search(query, filters={"user_id": user_id})
+    except (TypeError, ValueError):
+        try:
+            results = m.search(query, user_id=user_id)
+        except:
+            results = m.search(query)
+    
+    # Handle both dict and list results
+    if isinstance(results, dict):
+        results = results.get("results", [])
+    
     if not results:
         print("No relevant memories found.")
         return
     for i, r in enumerate(results, 1):
-        print(f"[{i}] (score={r.get('score', '?'):.3f}) {r['memory']}")
+        score = r.get('score', r.get('similarity', '?'))
+        memory = r.get('memory', r.get('text', str(r)))
+        print(f"[{i}] (score={score:.3f}) {memory}")
 
 def cmd_list(m, user_id="default_user"):
-    memories = m.get_all(user_id=user_id)
+    # Try new API first (filters=), fall back to old API (user_id=)
+    try:
+        memories = m.get_all(filters={"user_id": user_id})
+    except (TypeError, ValueError):
+        try:
+            memories = m.get_all(user_id=user_id)
+        except:
+            memories = m.get_all()
+    
+    # Handle both dict and list results
+    if isinstance(memories, dict):
+        memories = memories.get("results", [])
+    
     if not memories:
         print("No memories stored.")
         return
     for i, mem in enumerate(memories, 1):
-        print(f"[{i}] {mem['memory']}")
+        memory_text = mem.get('memory', mem.get('text', str(mem)))
+        print(f"[{i}] {memory_text}")
 
 def cmd_chat(m, prompt, user_id="default_user"):
     """Retrieve relevant memories and inject them into a chat request."""
@@ -446,8 +481,20 @@ def cmd_chat(m, prompt, user_id="default_user"):
     api_key  = cfg["llm"]["config"]["api_key"]
     model    = cfg["llm"]["config"]["model"]
 
-    mems = m.search(prompt, user_id=user_id)
-    mem_text = "\n".join(f"- {r['memory']}" for r in mems) if mems else "None"
+    # Search with API compatibility
+    try:
+        mems = m.search(prompt, filters={"user_id": user_id})
+    except (TypeError, ValueError):
+        try:
+            mems = m.search(prompt, user_id=user_id)
+        except:
+            mems = m.search(prompt)
+    
+    # Handle both dict and list results
+    if isinstance(mems, dict):
+        mems = mems.get("results", [])
+    
+    mem_text = "\n".join(f"- {r.get('memory', r.get('text', str(r)))}" for r in mems) if mems else "None"
     system_msg = f"You are a helpful assistant.\n\nRelevant memories about this user:\n{mem_text}"
 
     payload = json.dumps({
@@ -511,8 +558,39 @@ _mem0_test() {
         WARN "mem0 not installed. Use option 1."; sleep 2; return
     fi
 
+    # Detect embedder type from config — only warn about server if using openai embedder
+    local embedder_provider
+    embedder_provider=$("$MEM0_VENV/bin/python3" -c \
+        "import json; c=json.load(open('$MEM0_CONFIG')); print(c.get('embedder',{}).get('provider','openai'))" \
+        2>/dev/null || echo "openai")
+
+    local server_running=0
+    if [[ -f "$SERVER_PID_FILE" ]] && \
+       ps -p "$(cat "$SERVER_PID_FILE" 2>/dev/null || echo 0)" > /dev/null 2>&1; then
+        server_running=1
+    fi
+
+    if [[ "$embedder_provider" == "openai" ]] && (( server_running == 0 )); then
+        echo -e "${B_YELLOW}  ⚠  Embedder is set to 'openai' (llama-server) but llama-server is not running.${NC}"
+        echo "     Steps 3 and 4 (add/search memory) will fail with a connection error."
+        echo ""
+        echo "  Options:"
+        echo "  1) Start llama-server first (menu option 4), then re-run test"
+        echo "  2) Switch embedder to Ollama (Configure → option 2)"
+        echo "  3) Continue anyway (steps 1-2 will pass, 3-4 will show the error)"
+        local skip_choice=""
+        read -r -p "  Select [1-3]: " skip_choice
+        case $skip_choice in
+            1) WARN "Start llama-server then return here."; sleep 2; return ;;
+            2) _mem0_configure; return ;;
+            3) INFO "Continuing — expect connection errors at steps 3/4." ;;
+            *) return ;;
+        esac
+    fi
+
     STEP "1/4  Importing mem0…"
-    if ! "$MEM0_VENV/bin/python3" -c "from mem0 import Memory; print('  import OK')" 2>&1; then
+    if ! "$MEM0_VENV/bin/python3" -c \
+        "from mem0 import Memory; print('  import OK')" 2>&1; then
         ERR "Import failed. Check $MEM0_LOG"
         read -p "Press Enter to return..."; return
     fi
@@ -532,38 +610,59 @@ except Exception as e:
 PYEOF
 
     STEP "3/4  Adding a test memory…"
-    "$MEM0_VENV/bin/python3" - << PYEOF 2>&1
+    "$MEM0_VENV/bin/python3" - << PYEOF 2>&1 | tee -a "$MEM0_LOG"
 import json
 from mem0 import Memory
 with open("$MEM0_CONFIG") as f:
     cfg = json.load(f)
 m = Memory.from_config(cfg)
-result = m.add([{"role":"user","content":"mem0 integration test message"}],
-               user_id="test_user")
-print(f"  Added {len(result)} memory entries.")
+# mem0 >=0.1.x: user_id goes in metadata, not as kwarg
+result = m.add(
+    [{"role": "user", "content": "mem0 integration test message"}],
+    user_id="test_user"
+)
+count = len(result) if isinstance(result, list) else (
+    len(result.get("results", [])) if isinstance(result, dict) else 1
+)
+print(f"  Added {count} memory entry/entries.")
 PYEOF
 
     STEP "4/4  Searching memories…"
-    "$MEM0_VENV/bin/python3" - << PYEOF 2>&1
+    "$MEM0_VENV/bin/python3" - << PYEOF 2>&1 | tee -a "$MEM0_LOG"
 import json
 from mem0 import Memory
 with open("$MEM0_CONFIG") as f:
     cfg = json.load(f)
 m = Memory.from_config(cfg)
-results = m.search("integration test", user_id="test_user")
+
+# Try new API first (filters=), fall back to old API (user_id=)
+try:
+    results = m.search("integration test", filters={"user_id": "test_user"})
+except (TypeError, ValueError):
+    try:
+        results = m.search("integration test", user_id="test_user")
+    except:
+        results = m.search("integration test")
+
+# Handle both dict and list results
+if isinstance(results, dict):
+    results = results.get("results", [])
+
 if results:
     print(f"  Found {len(results)} result(s) — mem0 round-trip OK")
-    for r in results:
-        print(f"    [{r.get('score','?'):.3f}] {r['memory']}")
+    for r in results[:3]:
+        score = r.get("score", r.get("similarity", "?"))
+        mem   = r.get("memory", r.get("text", str(r)))
+        print(f"    [{score}] {mem}")
 else:
-    print("  No results — store may be empty or embedding failed")
+    print("  No results — store may be empty or embedding step failed")
 PYEOF
 
     echo ""
     OK "Test complete. See above for results."
     echo ""
     echo "  Client script: $MEM0_SCRIPT"
-    echo "  Usage: $MEM0_VENV/bin/python3 $MEM0_SCRIPT --help"
+    echo "  Usage: $MEM0_VENV/bin/python3 $MEM0_SCRIPT list"
     read -p "Press Enter to return..."
 }
 
