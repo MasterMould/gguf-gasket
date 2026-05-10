@@ -436,9 +436,9 @@ with open("$MEM0_CONFIG") as f:
 cfg["llm"]["config"]["openai_base_url"] = "$url/v1"
 cfg["llm"]["config"]["api_key"] = "$apikey"
 # Only update embedder URL if it is also the openai provider
-if cfg.get("embedder",{}).get("provider") == "openai":
-    cfg["embedder"]["config"]["openai_base_url"] = "$url/v1"
-    cfg["embedder"]["config"]["api_key"] = "$apikey"
+#if cfg.get("embedder",{}).get("provider") == "openai":
+#    cfg["embedder"]["config"]["openai_base_url"] = "$url/v1"
+#    cfg["embedder"]["config"]["api_key"] = "$apikey"
 with open("$MEM0_CONFIG","w") as f:
     json.dump(cfg, f, indent=4)
 print("Config updated.")
