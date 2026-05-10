@@ -28,6 +28,17 @@ MEM0_CONFIG="$MEM0_DIR/config.json"
 MEM0_SCRIPT="$MEM0_DIR/mem0_client.py"
 MEM0_LOG="$MEM0_DIR/mem0.log"
 MEM0_DB_DIR="$MEM0_DIR/chroma_db"
+# Dedicated embedding server
+EMBED_DIR="$HOME/ai_stack/embeddings"
+EMBED_MODEL="$EMBED_DIR/nomic-embed-text-v1.5.Q4_K_M.gguf"
+EMBED_PORT="8081"
+
+EMBED_PID_FILE="$EMBED_DIR/embedding-server.pid"
+EMBED_LOG="$EMBED_DIR/embedding-server.log"
+
+EMBED_URL="http://127.0.0.1:${EMBED_PORT}/v1"
+
+EMBED_MODEL_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf"
 
 # ================================================================
 #  HELPERS
@@ -89,8 +100,15 @@ _mem0_status() {
 }
 
 _mem0_embedding_server_running() {
-    [[ -f "$EMBED_PID_FILE" ]] && \
-    ps -p "$(cat "$EMBED_PID_FILE" 2>/dev/null)" >/dev/null 2>&1
+    [[ -n "${EMBED_PID_FILE:-}" ]] || return 1
+    [[ -f "$EMBED_PID_FILE" ]] || return 1
+
+    local pid
+    pid=$(cat "$EMBED_PID_FILE" 2>/dev/null || true)
+
+    [[ -n "$pid" ]] || return 1
+
+    ps -p "$pid" >/dev/null 2>&1
 }
 
 _mem0_install_embedding_model() {
@@ -161,6 +179,7 @@ _mem0_start_embedding_server() {
         --host 0.0.0.0 \
         --port "$EMBED_PORT" \
         --embeddings \
+        --pooling mean \
         > "$EMBED_LOG" 2>&1 &
 
     echo $! > "$EMBED_PID_FILE"
