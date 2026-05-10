@@ -311,7 +311,7 @@ _mem0_install() {
     "$MEM0_VENV/bin/pip" install --upgrade pip 2>&1 | tail -2
 
     STEP "Installing mem0ai + chromadb (this may take 2–5 minutes)…"
-    "$MEM0_VENV/bin/pip" install "mem0ai[local]" chromadb openai 2>&1 \
+    "$MEM0_VENV/bin/pip" install "mem0ai[local]" chromadb openai spacy 2>&1 \
         | tee -a "$MEM0_LOG" \
         | grep -E "Successfully|error|ERROR|Collecting mem0|Installing" || true
 
