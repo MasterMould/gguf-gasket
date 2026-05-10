@@ -71,6 +71,12 @@ _mem0_status() {
         echo -e "    DB size  : $db_size  ($MEM0_DB_DIR)"
     fi
 
+    if _mem0_embedding_server_running; then
+        echo -e "    Embed server : ${B_GREEN}running${NC} ${EMBED_URL}"
+    else
+        echo -e "    Embed server : ${B_YELLOW}stopped${NC}"
+    fi
+
     # Check if llama-server is running to show integration target
     if [[ -f "$SERVER_PID_FILE" ]] && \
        ps -p "$(cat "$SERVER_PID_FILE" 2>/dev/null)" > /dev/null 2>&1; then
@@ -80,6 +86,144 @@ _mem0_status() {
     else
         echo -e "    llama-server: ${B_YELLOW}stopped${NC} (start it for full integration test)"
     fi
+}
+
+_mem0_embedding_server_running() {
+    [[ -f "$EMBED_PID_FILE" ]] && \
+    ps -p "$(cat "$EMBED_PID_FILE" 2>/dev/null)" >/dev/null 2>&1
+}
+
+_mem0_install_embedding_model() {
+    draw_header
+    echo -e "${B_CYAN}[ mem0 — Install Embedding Model ]${NC}"
+    echo ""
+
+    mkdir -p "$EMBED_DIR"
+
+    if [[ -f "$EMBED_MODEL" ]]; then
+        OK "Embedding model already installed:"
+        echo "  $EMBED_MODEL"
+        read -p "Press Enter to return..."
+        return
+    fi
+
+    STEP "Downloading nomic-embed-text GGUF..."
+
+    if command -v wget >/dev/null 2>&1; then
+        wget -O "$EMBED_MODEL" "$EMBED_MODEL_URL"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -L "$EMBED_MODEL_URL" -o "$EMBED_MODEL"
+    else
+        ERR "Neither wget nor curl found."
+        read -p "Press Enter to return..."
+        return 1
+    fi
+
+    if [[ -f "$EMBED_MODEL" ]]; then
+        OK "Embedding model installed."
+    else
+        ERR "Download failed."
+    fi
+
+    read -p "Press Enter to return..."
+}
+
+_mem0_start_embedding_server() {
+    draw_header
+    echo -e "${B_CYAN}[ mem0 — Start Embedding Server ]${NC}"
+    echo ""
+
+    if _mem0_embedding_server_running; then
+        OK "Embedding server already running."
+        echo "  URL: $EMBED_URL"
+        read -p "Press Enter to return..."
+        return
+    fi
+
+    if [[ ! -f "$EMBED_MODEL" ]]; then
+        ERR "Embedding model not installed."
+        echo ""
+        echo "Install it first from menu option 4."
+        read -p "Press Enter to return..."
+        return 1
+    fi
+
+    if ! command -v llama-server >/dev/null 2>&1; then
+        ERR "llama-server not found in PATH."
+        read -p "Press Enter to return..."
+        return 1
+    fi
+
+    STEP "Starting embedding server..."
+
+    nohup llama-server \
+        -m "$EMBED_MODEL" \
+        --host 0.0.0.0 \
+        --port "$EMBED_PORT" \
+        --embeddings \
+        > "$EMBED_LOG" 2>&1 &
+
+    echo $! > "$EMBED_PID_FILE"
+
+    sleep 4
+
+    if curl -s "$EMBED_URL/models" >/dev/null 2>&1; then
+        OK "Embedding server online."
+        echo "  URL: $EMBED_URL"
+
+        # Auto-update mem0 config
+        if [[ -f "$MEM0_CONFIG" ]]; then
+            "$MEM0_VENV/bin/python3" - << PYEOF
+import json
+with open("$MEM0_CONFIG") as f:
+    cfg = json.load(f)
+
+cfg["embedder"] = {
+    "provider": "openai",
+    "config": {
+        "model": "nomic-embed",
+        "openai_base_url": "$EMBED_URL",
+        "api_key": "localtest"
+    }
+}
+
+with open("$MEM0_CONFIG","w") as f:
+    json.dump(cfg, f, indent=4)
+
+print("Updated embedder config.")
+PYEOF
+        fi
+
+    else
+        ERR "Embedding server failed to start."
+        echo ""
+        echo "Check:"
+        echo "  $EMBED_LOG"
+    fi
+
+    read -p "Press Enter to return..."
+}
+
+_mem0_stop_embedding_server() {
+    draw_header
+    echo -e "${B_CYAN}[ mem0 — Stop Embedding Server ]${NC}"
+    echo ""
+
+    if ! _mem0_embedding_server_running; then
+        WARN "Embedding server is not running."
+        read -p "Press Enter to return..."
+        return
+    fi
+
+    local pid
+    pid=$(cat "$EMBED_PID_FILE")
+
+    kill "$pid" 2>/dev/null
+    rm -f "$EMBED_PID_FILE"
+
+    OK "Embedding server stopped."
+
+    read -p "Press Enter to return..."
 }
 
 # ================================================================
@@ -188,6 +332,11 @@ _mem0_write_default_config() {
         info_url=$(grep -oP 'https?://[^\s]+' "$SERVER_INFO_FILE" 2>/dev/null | head -1) || true
         info_key=$(grep -oP 'Key\s*:.*\K\S+$' "$SERVER_INFO_FILE" 2>/dev/null | head -1) || true
         [[ -n "$info_url" ]] && detected_url="${info_url%/}/v1"
+    # llama.cpp local servers are almost always plain HTTP
+    if [[ "$detected_url" =~ ^https://(127\.0\.0\.1|192\.168\.|10\.) ]]; then
+        WARN "Detected local HTTPS URL. Converting to HTTP for llama.cpp compatibility."
+        detected_url="${detected_url/https:/http:}"
+    fi
         [[ -n "$info_key" ]] && detected_key="$info_key"
     fi
 
@@ -209,17 +358,19 @@ _mem0_write_default_config() {
         }
     },
     "embedder": {
-        "provider": "ollama",
+        "provider": "openai",
         "config": {
-            "model": "nomic-embed-text",
-            "ollama_base_url": "http://127.0.0.1:11434"
+            "model": "nomic-embed",
+            "openai_base_url": "${EMBED_URL}",
+           "api_key": "localtest"
         }
     }
 }
+
 JSONEOF
     INFO "Config written. LLM endpoint: ${detected_url}"
-    INFO "Embedder: ollama nomic-embed-text (local, no server needed for storage)"
-    WARN "If Ollama is not running, switch embedder in Configure → option 2"
+INFO "Embedder: dedicated llama.cpp embedding server"
+WARN "Install/start embedding server from the mem0 menu if not already running."
 }
 
 _mem0_configure() {
@@ -588,6 +739,23 @@ _mem0_test() {
         esac
     fi
 
+        echo ""
+        STEP "0/4  Checking embedding endpoint..."
+
+        if ! curl -s "$EMBED_URL/models" >/dev/null 2>&1; then
+        ERR "Embedding server unavailable."
+        echo ""
+        echo "Start it using:"
+        echo "  mem0 → Start Embedding Server"
+        echo ""
+        echo "Expected endpoint:"
+        echo "  $EMBED_URL"
+        read -p "Press Enter to return..."
+        return
+    fi
+
+OK "Embedding endpoint reachable."
+
     STEP "1/4  Importing mem0…"
     if ! "$MEM0_VENV/bin/python3" -c \
         "from mem0 import Memory; print('  import OK')" 2>&1; then
@@ -711,9 +879,12 @@ mem0_menu() {
         echo -e "  1) ${B_GREEN}Install mem0ai${NC}"
         echo -e "  2) ${B_CYAN}Configure${NC}              (URL, API key, vector store)"
         echo -e "  3) ${B_CYAN}Test Integration${NC}       (store → search round-trip)"
-        echo -e "  4) ${B_YELLOW}Upgrade mem0ai${NC}"
-        echo -e "  5) ${B_RED}Reset / Uninstall${NC}"
-        echo -e "  6) Back"
+        echo -e "  4) ${B_GREEN}Install Embedding Model${NC}"
+        echo -e "  5) ${B_GREEN}Start Embedding Server${NC}"
+        echo -e "  6) ${B_YELLOW}Stop Embedding Server${NC}"
+        echo -e "  7) ${B_YELLOW}Upgrade mem0ai${NC}"
+        echo -e "  8) ${B_RED}Reset / Uninstall${NC}"
+        echo -e "  9) Back"
         echo ""
         local choice=""
         read -r -p "  Action: " choice
@@ -721,9 +892,12 @@ mem0_menu() {
             1) _mem0_install ;;
             2) _mem0_configure ;;
             3) _mem0_test ;;
-            4) _mem0_upgrade ;;
-            5) _mem0_reset ;;
-            6) return ;;
+            4) _mem0_install_embedding_model ;;
+            5) _mem0_start_embedding_server ;;
+            6) _mem0_stop_embedding_server ;;
+            7) _mem0_upgrade ;;
+            8) _mem0_reset ;;
+            9) return ;;
             *) echo -e "${B_RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
