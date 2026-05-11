@@ -218,6 +218,7 @@ PYEOF
         echo ""
         echo "Check:"
         echo "  $EMBED_LOG"
+        cat $EMBED_LOG
     fi
 
     read -p "Press Enter to return..."
@@ -261,7 +262,8 @@ _mem0_install() {
     echo "  Optional: Qdrant (requires Docker — configure after install)"
     echo ""
     echo "  Python 3.9+ required. Checking…"
-
+    sudo apt-get install python3 python3-venv python3-pip -y
+        
     local python_bin=""
     for py in python3 python3.12 python3.11 python3.10 python3.9; do
         if command -v "$py" &>/dev/null; then
