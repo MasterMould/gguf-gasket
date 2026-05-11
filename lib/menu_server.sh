@@ -62,14 +62,14 @@ manage_server() {
     # ── TLS / HTTP mode selection ──────────────────────────────────────────
     local cert_file="$INSTALL_DIR/server.crt"
     local key_file_ssl="$INSTALL_DIR/server.key"
-    local use_ssl=1
+    local use_ssl=0
 
     echo ""
     echo -e "  ${B_CYAN}Server mode:${NC}"
     echo -e "  1) HTTPS (self-signed TLS — recommended, needs -k with curl)"
     echo -e "  2) HTTP  (plain, no cert — easiest for local testing)"
     local srvmode=""
-    read -r -p "  Select [1-2] (default: 1): " srvmode
+    read -r -p "  Select [1-2] (default: 2): " srvmode
     [[ "$srvmode" == "2" ]] && use_ssl=0
 
     if (( use_ssl )); then
@@ -205,8 +205,10 @@ ${B_RED}✖ Server process died immediately. Check logs:${NC}"
     echo -e "  ${B_CYAN}Quick test:${NC}"
     if (( use_ssl )); then
         echo -e "  curl -sk ${server_url}/health -H \"Authorization: Bearer ${api_key}\""
+        curl -sk ${server_url}/health -H \"Authorization: Bearer ${api_key}\"
     else
         echo -e "  curl -s ${server_url}/health -H \"Authorization: Bearer ${api_key}\""
+        curl -s ${server_url}/health -H \"Authorization: Bearer ${api_key}\"
     fi
     echo -e "  ${B_YELLOW}Note: For network access set binding to 0.0.0.0 in Settings${NC}${ssl_note}"
     echo ""
