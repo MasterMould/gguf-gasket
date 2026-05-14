@@ -2,7 +2,7 @@
 # Menu module — auto-discovered by llama_manager.sh
 # To add this module's entry to the main menu, ensure:
 #   MENU_LABEL, MENU_FN, MENU_COLOR, and MENU_ORDER are set.
-MENU_LABEL="Download Models"
+MENU_LABEL="Download Models --FAULTY--"
 MENU_FN="download_menu"
 MENU_COLOR="${B_CYAN}"
 MENU_ORDER=20
