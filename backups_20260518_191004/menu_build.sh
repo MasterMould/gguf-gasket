@@ -87,7 +87,7 @@ build_engine() {
     fi
 
     local current_gpu
-    current_gpu=$(select_gpu_with_override)
+    current_gpu=$(detect_gpu)
     echo -e "${B_CYAN}Building AI Engine for $current_gpu...${NC}"
 
     # Base packages — libdnnl-dev excluded for Intel (system libdnnl lacks SYCL interop)
