@@ -36,7 +36,7 @@ declare -A FLAGS=(
   [GGML_AVX_VNNI]=OFF
   # SYCL
   [GGML_SYCL]=OFF
-  [GGML_SYCL_F16]=OFF
+  [GGML_SYCL_F16]=ON
   [GGML_SYCL_GRAPH]=ON
   [GGML_SYCL_HOST_MEM_FALLBACK]=ON
   [GGML_SYCL_SUPPORT_LEVEL_ZERO]=ON
@@ -54,7 +54,7 @@ declare -A FLAGS=(
   # llama
   [LLAMA_BUILD_SERVER]=ON
   [LLAMA_BUILD_EXAMPLES]=ON
-  [LLAMA_BUILD_TESTS]=OFF
+  [LLAMA_BUILD_TESTS]=ON
   [LLAMA_OPENSSL]=ON
   # Extra
   [GGML_BLAS]=OFF
@@ -330,9 +330,20 @@ do_purge() {
   confirm "Reboot now?" n && sudo reboot
 }
 
+Clean_System() {
+run_sudo apt-get clean
+# run_sudo rm /etc/apt/sources.list.d/intel-gpu-noble.list
+run_sudo apt-get update
+run_sudo apt-get autoremove --purge -y
+run_sudo apt --fix-broken install
+
+}
+
 do_install() {
   title "Install Drivers for: ${BACKEND^^}"
   require_sudo
+
+# Clean_System
 
   section "Updating package lists"
   run_sudo apt-get update
@@ -355,9 +366,9 @@ https://repositories.intel.com/gpu/ubuntu noble client" | \
         level-zero \
         intel-media-va-driver-non-free \
         intel-oneapi-mkl-devel libmfxgen1 libvpl2 \
-        intel-level-zero-gpu \
+        intel-level-zero-gpu libigc1 libigdfcl1 \
+        libigdgmm12 intel-oneapi-dnnl-devel \
 
-        libigdgmm12
       ok "Base runtime installed"
       ;;
   esac
@@ -380,8 +391,8 @@ https://apt.repos.intel.com/oneapi all main" | \
 
       run_sudo apt-get update
       run_sudo apt-get install -y \
-        intel-oneapi-dpcpp-cpp \
-        intel-oneapi-mkl-devel
+        intel-oneapi-dpcpp-cpp-2026.0 \
+        intel-oneapi-mkl-devel 
       ok "oneAPI DPC++ installed"
       info "Source oneAPI env with: source /opt/intel/oneapi/setvars.sh"
       ;;
@@ -587,6 +598,7 @@ if [[ $BACKEND == sycl ]]; then
 fi
 
   # Build cmake args
+  cmake_args+=("-DDNNL_DIR=${DNNLROOT}/lib/cmake/dnnl")
   local cmake_args=()
   for key in "${!FLAGS[@]}"; do
     cmake_args+=("-D${key}=${FLAGS[$key]}")
