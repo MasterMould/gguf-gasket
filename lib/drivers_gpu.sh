@@ -26,6 +26,7 @@ install_AMD_gpu_drivers() {
         mesa-vulkan-drivers
         libdrm-dev
         libdrm-amdgpu1
+        glslc
     )
     
     # Optional packages (may not be available on all Ubuntu versions)
