@@ -1,7 +1,5 @@
 #!/bin/bash
 # Menu module — auto-discovered by llama_manager.sh
-# To add this module's entry to the main menu, ensure:
-#   MENU_LABEL, MENU_FN, MENU_COLOR, and MENU_ORDER are set.
 MENU_LABEL="Interactive Chat"
 MENU_FN="chat_mode"
 MENU_COLOR="${B_GREEN}"
@@ -18,8 +16,7 @@ prompt_gpu_layers() {
     local default_ngl=0
     [[ "$current_gpu" != "CPU" ]] && default_ngl=99
 
-    echo -e "
-${B_CYAN}GPU Layer Offload:${NC}" >&2
+    echo -e "\n${B_CYAN}GPU Layer Offload:${NC}" >&2
     echo -e "  1)  0  — CPU only (no VRAM used)" >&2
     echo -e "  2) 16  — Partial offload (low VRAM, e.g. 4 GB)" >&2
     echo -e "  3) 32  — Moderate offload (e.g. 8 GB VRAM)" >&2
@@ -81,6 +78,49 @@ select_model() {
 }
 
 # ================================================================
+#  TERMINAL STATE RECOVERY
+# ================================================================
+# llama-cli's -cnv (conversational TUI) mode reconfigures the terminal
+# (raw mode, possibly mouse/cursor reporting). A clean exit restores
+# this itself. A crash (segfault, abort, kill) skips that teardown and
+# leaves the terminal in a state where the shell's `read` appears to
+# hang or echoes garbage — this is not the menu actually freezing, it's
+# stty settings left behind by the dead child. Always restore explicitly
+# after a non-zero/abnormal exit, regardless of cause.
+_chat_restore_terminal() {
+    # sane is the standard "best effort recovery" stty preset; safe to
+    # call even if the terminal was never modified.
+    stty sane 2>/dev/null
+    # Drop anything sitting in the input buffer (e.g. escape sequences
+    # the crashed TUI was mid-way through writing/reading) so the
+    # upcoming `read -p "Press Enter..."` doesn't immediately "complete"
+    # on garbage or get fed stray bytes.
+    read -r -t 0.1 -n 10000 _discard 2>/dev/null
+    true
+}
+
+# ================================================================
+#  EXIT CODE CLASSIFICATION
+# ================================================================
+# Bash reports a process killed by signal N as exit code 128+N.
+# 139 = 128+11 = SIGSEGV.  134 = 128+6 = SIGABRT.  This lets the error
+# box give an accurate, specific cause instead of a generic message.
+_chat_signal_name() {
+    local code="$1"
+    if (( code > 128 && code < 165 )); then
+        local sig=$(( code - 128 ))
+        case $sig in
+            6)  echo "SIGABRT (assertion failure / abort)" ;;
+            9)  echo "SIGKILL (killed — possibly OOM-killed by the kernel)" ;;
+            11) echo "SIGSEGV (segmentation fault — crashed reading memory)" ;;
+            *)  echo "signal $sig" ;;
+        esac
+    else
+        echo ""
+    fi
+}
+
+# ================================================================
 #  TERMINAL CHAT
 # ================================================================
 chat_mode() {
@@ -112,13 +152,30 @@ chat_mode() {
     local model
     model=$(select_model "Select model for chat [#]: ") || return
 
+    # Basic GGUF sanity check — catches truncated/corrupt downloads before
+    # they reach llama-cli, where a bad file is a common segfault trigger.
+    if ! head -c 4 "$model" 2>/dev/null | grep -q "GGUF"; then
+        local mname; mname=$(basename "$model")
+        local pad=$(( 28 - ${#mname} ))
+        (( pad < 0 )) && pad=0
+        echo -e ""
+        echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+        echo -e "${B_RED}║  ✖  Invalid or corrupt model file            ║${NC}"
+        echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${B_RED}║${NC}  File does not start with the GGUF magic     ${B_RED}║${NC}"
+        echo -e "${B_RED}║${NC}  bytes — likely truncated or corrupted.      ${B_RED}║${NC}"
+        echo -e "${B_RED}║${NC}  Re-download: ${B_YELLOW}${mname}${NC}$(printf '%*s' "$pad" '')${B_RED}║${NC}"
+        echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        read -rp "Press Enter to return to menu..."
+        return
+    fi
+
     local ngl
     ngl=$(prompt_gpu_layers "$current_gpu")
 
     echo -e "${B_CYAN}Launching chat with $(basename "$model")${NC}"
     echo -e "${B_YELLOW}  Context: $context_size tokens | GPU layers: $ngl${NC}"
     echo -e "${B_YELLOW}  (Type /bye to quit or Ctrl+C to force exit)${NC}"
-#    echo -e "${B_YELLOW}  --no-context-shift: chat will STOP when context window is full${NC}"
 
     # Capture stderr synchronously — process substitution is async and may be
     # empty when read immediately after the command. Direct redirect is reliable.
@@ -138,6 +195,12 @@ chat_mode() {
         2>"$stderr_log" \
         || chat_exit=$?
 
+    # ALWAYS restore terminal state after llama-cli returns, regardless of
+    # exit code. A crash mid-TUI-setup is the #1 cause of the menu appearing
+    # "unresponsive" afterward — it isn't frozen, the terminal driver is just
+    # left in a state the shell's `read` can't interact with normally.
+    _chat_restore_terminal
+
     # Echo captured stderr so the user sees it, then use it for diagnosis
     cat "$stderr_log" >&2
 
@@ -146,6 +209,9 @@ chat_mode() {
         local stderr_content
         stderr_content=$(cat "$stderr_log" 2>/dev/null || true)
         rm -f "$stderr_log"
+
+        local sig_desc
+        sig_desc=$(_chat_signal_name "$chat_exit")
 
         if echo "$stderr_content" | grep -qi "No device of requested type\|no devices\|SYCL.*not found\|level.zero.*error"; then
             echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
@@ -163,6 +229,26 @@ chat_mode() {
             echo -e "${B_RED}║${NC}  Context: ${B_YELLOW}$context_size tokens${NC} was exhausted.$(printf '%*s' $((12 - ${#context_size})) '')${B_RED}║${NC}"
             echo -e "${B_RED}║${NC}  Increase it in ${B_YELLOW}Settings → Context Size${NC}.     ${B_RED}║${NC}"
             echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        elif [[ "$chat_exit" == "139" ]]; then
+            # SIGSEGV — specific, actionable box instead of the generic catch-all.
+            echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "${B_RED}║  ✖  Segmentation fault (crash) — exit 139    ║${NC}"
+            echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+            echo -e "${B_RED}║${NC}  llama-cli crashed while loading the model.  ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Common causes, in order of likelihood:      ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}    • Corrupt/truncated .gguf — re-download   ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}    • Quant type unsupported by this SYCL     ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}      build — try Vulkan or CPU backend       ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}    • Try ${B_YELLOW}0 GPU layers${NC} to isolate GPU vs CPU  ${B_RED}║${NC}"
+            echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
+        elif [[ "$chat_exit" == "134" ]]; then
+            echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "${B_RED}║  ✖  Aborted (assertion failure) — exit 134   ║${NC}"
+            echo -e "${B_RED}╠══════════════════════════════════════════════╣${NC}"
+            echo -e "${B_RED}║${NC}  llama-cli hit an internal assertion.        ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  Check the captured stderr above for the     ${B_RED}║${NC}"
+            echo -e "${B_RED}║${NC}  specific assertion message.                 ${B_RED}║${NC}"
+            echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
         else
             echo -e "${B_RED}╔══════════════════════════════════════════════╗${NC}"
             echo -e "${B_RED}║  Chat ended (exit code $chat_exit)$(printf '%*s' $((31 - ${#chat_exit})) '')║${NC}"
@@ -172,9 +258,12 @@ chat_mode() {
             echo -e "${B_RED}║${NC}  If GPU layers > 0, try ${B_YELLOW}0 layers (CPU)${NC}.     ${B_RED}║${NC}"
             echo -e "${B_RED}╚══════════════════════════════════════════════╝${NC}"
         fi
+        if [[ -n "$sig_desc" ]]; then
+            echo -e "${B_YELLOW}  Signal detail: ${sig_desc}${NC}"
+        fi
     else
         rm -f "$stderr_log"
     fi
 
-    read -p "Press Enter to return to menu..."
+    read -rp "Press Enter to return to menu..."
 }
