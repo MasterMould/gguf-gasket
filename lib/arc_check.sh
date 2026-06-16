@@ -82,6 +82,27 @@ arc_opencl_ok() {
     clinfo 2>/dev/null | grep -Eqi "Device Name.*(Intel|Arc)"
 }
 
+# Debug helper: dumps the exact raw clinfo output and the grep result against
+# it, with byte-level visibility (cat -A shows tabs/CR/trailing-space that are
+# invisible in a normal terminal). Use this when arc_opencl_ok disagrees with
+# what clinfo visibly prints — it will reveal the actual discrepancy instead
+# of guessing at it.
+arc_opencl_debug() {
+    if ! command -v clinfo &>/dev/null; then
+        echo "clinfo not installed"
+        return 1
+    fi
+    local raw; raw=$(clinfo 2>&1)
+    echo "── exit code of clinfo: $? ──"
+    echo "── raw output, byte-visible (cat -A) ──"
+    echo "$raw" | grep -i "device name" | cat -A
+    echo "── does it match our pattern? ──"
+    echo "$raw" | grep -Eqi "Device Name.*(Intel|Arc)" \
+        && echo "MATCH" || echo "NO MATCH"
+    echo "── line count, char count ──"
+    echo "$raw" | wc -lc
+}
+
 # Returns the Intel device name from clinfo, or empty string
 arc_opencl_device_name() {
     command -v clinfo &>/dev/null || return 1
