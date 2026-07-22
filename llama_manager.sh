@@ -1528,6 +1528,7 @@ manage_server() {
         --host "$visible2network"
         --port "$network_port"
         --api-key "$api_key"
+        --tools all
     )
     if (( use_ssl )); then
         server_cmd+=(--ssl-key-file "$key_file_ssl" --ssl-cert-file "$cert_file")
