@@ -38,7 +38,7 @@ USER_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
 RC_FILE="${USER_HOME}/.bashrc"
 VENV_DIR="${USER_HOME}/.local/share/openvino-venv"
 WORK_DIR=""
-cleanup_work_dir() { [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"; }
+cleanup_work_dir() { [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"; return 0; }
 trap cleanup_work_dir EXIT
 
 # ---- OVMS (OpenVINO Model Server) ----
@@ -363,18 +363,21 @@ ovms_run() {
     as_user "LD_LIBRARY_PATH='${OVMS_LIB}' '${OVMS_BIN}' $1"
 }
 
-# Queries the live Hugging Face API for models under the OpenVINO org
-# (optionally filtered by a search term), sorted by downloads. Prints
+# Queries the live Hugging Face API, optionally scoped to an org/author and
+# a search term, sorted by downloads. Prints
 # "index<TAB>model_id<TAB>pipeline_tag<TAB>downloads" per line, or
 # "EMPTY" / "ERROR:<msg>" on stderr. Pure-stdlib python3, no extra deps.
 hf_search() {
-    local term="$1"
+    local term="$1" author="${2:-}"
     local py="${WORK_DIR}/hf_search.py"
     cat > "$py" <<'PYEOF'
 import sys, json, urllib.request, urllib.parse
 
 term = sys.argv[1] if len(sys.argv) > 1 else ""
-params = {"author": "OpenVINO", "sort": "downloads", "direction": "-1", "limit": "20"}
+author = sys.argv[2] if len(sys.argv) > 2 else ""
+params = {"sort": "downloads", "direction": "-1", "limit": "20"}
+if author:
+    params["author"] = author
 if term:
     params["search"] = term
 url = "https://huggingface.co/api/models?" + urllib.parse.urlencode(params)
@@ -395,7 +398,7 @@ for i, m in enumerate(data, 1):
     dl = m.get("downloads", 0)
     print(f"{i}\t{mid}\t{tag}\t{dl}")
 PYEOF
-    python3 "$py" "$term"
+    python3 "$py" "$term" "$author"
 }
 
 # Rough default for the ovms --task flag based on the HF pipeline_tag,
@@ -408,13 +411,13 @@ suggest_task() {
     esac
 }
 
-do_model_browse() {
-    cleanup_work_dir; WORK_DIR="$(mktemp -d)"
-    read -r -p "Search OpenVINO models on Hugging Face (blank = show most downloaded): " term
-
+# Runs hf_search, prints a numbered table, and lets the person pick one.
+# Sets SELECTED_MODEL / SELECTED_TASK on success. Returns 1 on cancel/empty/error.
+hf_search_and_pick() {
+    local term="$1" author="${2:-}"
     log "Querying Hugging Face..."
     local raw
-    raw="$(hf_search "$term" 2>&1)" || { warn "Search failed: ${raw}"; return 1; }
+    raw="$(hf_search "$term" "$author" 2>&1)" || { warn "Search failed: ${raw}"; return 1; }
     if [[ "$raw" == "EMPTY" ]]; then
         warn "No models found for '${term}'."
         return 1
@@ -435,13 +438,80 @@ do_model_browse() {
     done <<< "$raw"
     echo
 
-    read -r -p "Pick a number to pull (or blank to cancel): " pick
+    read -r -p "Pick a number (or blank to cancel): " pick
     [[ -n "$pick" && -n "${ids[$pick]:-}" ]] || { warn "Cancelled."; return 1; }
 
     SELECTED_MODEL="${ids[$pick]}"
     SELECTED_TASK="$(suggest_task "${tags[$pick]}")"
+}
+
+# Parses a GGUF file's own header (pure stdlib python, reads only the small
+# metadata section, never the weights) and prints any key/value whose key
+# suggests the original base model — so we can suggest a search term instead
+# of requiring the person to already know the exact HF repo id.
+gguf_hints() {
+    local gguf_path="$1"
+    local py="${WORK_DIR}/gguf_meta.py"
+    cat > "$py" <<'PYEOF'
+import sys, struct
+
+def read_str(f):
+    (n,) = struct.unpack('<Q', f.read(8))
+    return f.read(n).decode('utf-8', errors='replace')
+
+TYPE_SIZES = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
+TYPE_FMT = {0:'<B',1:'<b',2:'<H',3:'<h',4:'<I',5:'<i',6:'<f',7:'<B',10:'<Q',11:'<q',12:'<d'}
+
+def read_value(f, vtype):
+    if vtype == 8:
+        return read_str(f)
+    if vtype == 9:
+        (elem_type,) = struct.unpack('<I', f.read(4))
+        (count,) = struct.unpack('<Q', f.read(8))
+        return [read_value(f, elem_type) for _ in range(count)]
+    if vtype in TYPE_FMT:
+        return struct.unpack(TYPE_FMT[vtype], f.read(TYPE_SIZES[vtype]))[0]
+    raise ValueError(f"unknown gguf value type {vtype}")
+
+def main():
+    path = sys.argv[1]
+    with open(path, 'rb') as f:
+        if f.read(4) != b'GGUF':
+            print("ERROR:not a GGUF file", file=sys.stderr)
+            sys.exit(1)
+        (version,) = struct.unpack('<I', f.read(4))
+        if version >= 2:
+            f.read(8)  # tensor_count (uint64)
+            (kv_count,) = struct.unpack('<Q', f.read(8))
+        else:
+            f.read(4)  # tensor_count (uint32, v1)
+            (kv_count,) = struct.unpack('<I', f.read(4))
+
+        wanted = ('name', 'basename', 'base_model', 'source', 'repo', 'organization', 'architecture', 'finetune')
+        for _ in range(kv_count):
+            key = read_str(f)
+            (vtype,) = struct.unpack('<I', f.read(4))
+            val = read_value(f, vtype)
+            if any(w in key.lower() for w in wanted):
+                print(f"{key}\t{val}")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR:{e}", file=sys.stderr)
+        sys.exit(1)
+PYEOF
+    python3 "$py" "$gguf_path"
+}
+
+do_model_browse() {
+    cleanup_work_dir; WORK_DIR="$(mktemp -d)"
+    read -r -p "Search OpenVINO models on Hugging Face (blank = show most downloaded): " term
+    hf_search_and_pick "$term" "OpenVINO" || return 1
     SELECTED_MODE="pull"
 }
+
 
 do_model_pull() {
     [[ -x "$OVMS_BIN" ]] || die "Install OVMS first."
@@ -501,7 +571,7 @@ do_model_pull() {
 
     read -r -p "Register in ${OVMS_CONFIG_PATH} for multi-model serving? [Y/n] " reg
     if [[ "${reg,,}" != "n" ]]; then
-        ovms_run "--add_to_config --config_path \"${OVMS_CONFIG_PATH}\" --model_name \"${model_name}\" --model_path \"${MODEL_REPO_DIR}/${model_name}\" --target_device \"${device}\" --task \"${task}\""
+        ovms_run "--add_to_config --config_path \"${OVMS_CONFIG_PATH}\" --model_name \"${model_name}\" --model_path \"${MODEL_REPO_DIR}/${model_name}\""
         log "Registered. Start the server to serve all registered models."
     fi
 }
@@ -526,6 +596,7 @@ model_scan_paths() {
 
 do_model_scan() {
     [[ -x "$OVMS_BIN" ]] || die "Install OVMS first."
+    cleanup_work_dir; WORK_DIR="$(mktemp -d)"
 
     read -r -p "Also scan a custom path? (blank to skip): " custom
     if [[ -n "$custom" ]]; then
@@ -585,11 +656,17 @@ do_model_scan() {
     local dest="${MODEL_REPO_DIR}/${model_name}"
     mkdir -p "$MODEL_REPO_DIR"; chown "${REAL_USER}:${REAL_USER}" "$MODEL_REPO_DIR"
 
-    if [[ "$sel_path" == "$MODEL_REPO_DIR"/* ]]; then
-        dest="$sel_path"
-        log "Already inside ${MODEL_REPO_DIR}, registering in place."
+    # "Already correctly placed" means: the file (GGUF) or directory (IR)
+    # already lives at exactly $MODEL_REPO_DIR/$model_name/... — not just
+    # "somewhere under MODEL_REPO_DIR" (a stray flat .gguf there wouldn't
+    # have a directory for --model_path to point at).
+    local sel_parent
+    sel_parent="$([[ "$sel_type" == "GGUF" ]] && dirname "$sel_path" || echo "$sel_path")"
+
+    if [[ "$sel_parent" == "$dest" ]]; then
+        log "Already correctly placed at ${dest}, registering in place."
     elif [[ -e "$dest" ]]; then
-        warn "${dest} already exists, registering in place (not re-linking)."
+        warn "${dest} already exists, registering in place (not re-linking) — verify it's the same model."
     else
         read -r -p "Symlink or copy into ${dest}? [S/c]: " method
         as_user "mkdir -p '${dest}'"
@@ -615,9 +692,38 @@ do_model_scan() {
     read -r -p "Task [text_generation]: " task
     task="${task:-text_generation}"
 
-    local extra_flag=""
+    local src_hint=""
     if [[ "$sel_type" == "GGUF" ]]; then
-        extra_flag="--gguf_filename \"$(basename "$sel_path")\""
+        echo
+        log "Reading embedded GGUF metadata for hints on the source model..."
+        local meta guess=""
+        meta="$(gguf_hints "$sel_path" 2>&1)"
+        if [[ -n "$meta" && "$meta" != ERROR:* ]]; then
+            echo "$meta"
+            guess="$(awk -F'\t' '
+                /base_model.*name/ && !g {g=$2}
+                /^general\.basename/ {b=$2}
+                /^general\.name/ {n=$2}
+                END {if (g) print g; else if (b) print b; else if (n) print n}
+            ' <<< "$meta")"
+        else
+            warn "No usable metadata embedded in this file."
+        fi
+
+        echo
+        echo "OVMS needs an HF repo id for this GGUF's tokenizer/chat-template"
+        echo "metadata (weights stay local — this only fetches that small config)."
+        while true; do
+            read -r -p "Search Hugging Face for the source model [${guess:-type a search term}]: " term
+            term="${term:-$guess}"
+            [[ -n "$term" ]] || { warn "Need something to search for."; continue; }
+            if hf_search_and_pick "$term" ""; then
+                src_hint="$SELECTED_MODEL"
+                break
+            fi
+            read -r -p "Try another search? [Y/n] " again
+            [[ "${again,,}" == "n" ]] && { warn "Skipping this model."; return 1; }
+        done
     fi
 
     echo
@@ -627,10 +733,19 @@ do_model_scan() {
     echo "    path:    ${dest}"
     echo "    device:  ${device}"
     echo "    task:    ${task}"
+    [[ -n "$src_hint" ]] && echo "    source:  ${src_hint} (tokenizer/config only)"
     read -r -p "Proceed? [Y/n] " go
     [[ "${go,,}" == "n" ]] && { warn "Cancelled."; return 1; }
 
-    ovms_run "--add_to_config --config_path \"${OVMS_CONFIG_PATH}\" --model_name \"${model_name}\" --model_path \"${dest}\" --target_device \"${device}\" --task \"${task}\" ${extra_flag}"
+    if [[ "$sel_type" == "GGUF" ]]; then
+        # This "pulls" against the already-present local file: OVMS skips
+        # re-downloading the weights (they're already at model_path) and
+        # only fetches tokenizer/chat-template metadata from src_hint, then
+        # writes the graph config add_to_config needs.
+        ovms_run "--pull --source_model \"${src_hint}\" --model_repository_path \"${MODEL_REPO_DIR}\" --model_name \"${model_name}\" --target_device \"${device}\" --task \"${task}\" --gguf_filename \"$(basename "$sel_path")\""
+    fi
+
+    ovms_run "--add_to_config --config_path \"${OVMS_CONFIG_PATH}\" --model_name \"${model_name}\" --model_path \"${dest}\""
     log "Registered. Start the server to serve all registered models."
 }
 
@@ -722,20 +837,22 @@ OpenVINO ${OV_VERSION} / OVMS ${OVMS_VERSION} manager (Ubuntu 26.04)
 
  13) Exit
 EOF
-    read -r -p "Select an option [1-13]: " choice
+    read -r -p "Select an option [1-13]: " choice || { echo; exit 0; }
     case "$choice" in
-        1) do_install ;;
-        2) do_uninstall ;;
-        3) do_verify ;;
-        4) need_root; [[ -f "$SETUPVARS" ]] || die "OpenVINO not installed."; setup_python_env ;;
-        5) do_ovms_install ;;
-        6) do_ovms_uninstall ;;
-        7) ovms_repair_libs ;;
-        8) do_model_pull ;;
-        9) do_model_scan ;;
-        10) do_ovms_start ;;
-        11) do_ovms_stop ;;
-        12) do_ovms_status ;;
+        1) ( trap cleanup_work_dir EXIT; do_install )                            || warn "Install did not complete — back at menu." ;;
+        2) ( trap cleanup_work_dir EXIT; do_uninstall )                          || warn "Uninstall did not complete — back at menu." ;;
+        3) ( trap cleanup_work_dir EXIT; do_verify )                             || warn "Verify failed — back at menu." ;;
+        4) ( trap cleanup_work_dir EXIT
+             need_root; [[ -f "$SETUPVARS" ]] || die "OpenVINO not installed."; setup_python_env ) \
+                                                                                   || warn "Venv repair did not complete — back at menu." ;;
+        5) ( trap cleanup_work_dir EXIT; do_ovms_install )                       || warn "OVMS install did not complete — back at menu." ;;
+        6) ( trap cleanup_work_dir EXIT; do_ovms_uninstall )                     || warn "OVMS uninstall did not complete — back at menu." ;;
+        7) ( trap cleanup_work_dir EXIT; ovms_repair_libs )                      || warn "Lib repair did not complete — back at menu." ;;
+        8) ( trap cleanup_work_dir EXIT; do_model_pull )                         || warn "Pull did not complete — back at menu." ;;
+        9) ( trap cleanup_work_dir EXIT; do_model_scan )                         || warn "Scan did not complete — back at menu." ;;
+        10) ( trap cleanup_work_dir EXIT; do_ovms_start )                        || warn "Server did not start — back at menu." ;;
+        11) ( trap cleanup_work_dir EXIT; do_ovms_stop )                         || warn "Stop did not complete — back at menu." ;;
+        12) ( trap cleanup_work_dir EXIT; do_ovms_status )                       || warn "Status check failed — back at menu." ;;
         13) exit 0 ;;
         *) warn "Invalid option." ;;
     esac
