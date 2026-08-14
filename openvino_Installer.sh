@@ -67,6 +67,34 @@ need_root() { [[ $EUID -eq 0 ]] || die "Run this with sudo."; }
 
 as_user() { sudo -u "$REAL_USER" -H bash -c "$1"; }
 
+# Runs a command in the background and prints a periodic heartbeat while it's
+# alive, for steps that can run silently for a long time (apt-get, pip,
+# optimum-cli quantization/conversion — which can genuinely take hours on a
+# large model). Prints full lines (not \r-overwrites) so it doesn't fight
+# with a wrapped tool's own progress bar (curl, ovms's native pull meter).
+# Preserves the wrapped command's real exit status.
+with_heartbeat() {
+    local msg="$1"; shift
+    local start=$SECONDS
+    "$@" &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 30
+        kill -0 "$pid" 2>/dev/null || break
+        local elapsed=$((SECONDS - start))
+        printf '[*] %s — still running (%dm%02ds elapsed)\n' "$msg" $((elapsed / 60)) $((elapsed % 60))
+    done
+    local rc
+    if wait "$pid"; then rc=0; else rc=$?; fi
+    local elapsed=$((SECONDS - start))
+    if [[ $rc -eq 0 ]]; then
+        printf '[*] %s — done (%dm%02ds)\n' "$msg" $((elapsed / 60)) $((elapsed % 60))
+    else
+        printf '[!] %s — failed after %dm%02ds (exit %d)\n' "$msg" $((elapsed / 60)) $((elapsed % 60)) "$rc"
+    fi
+    return $rc
+}
+
 # ---------------------------------------------------------------------
 # Python detection / venv bootstrap
 # ---------------------------------------------------------------------
@@ -87,7 +115,7 @@ install_python_via_deadsnakes() {
     apt-get install -y software-properties-common
     add-apt-repository -y ppa:deadsnakes/ppa
     apt-get update -y
-    apt-get install -y "${target}" "${target}-venv" "${target}-dev" \
+    with_heartbeat "apt-get install ${target}" apt-get install -y "${target}" "${target}-venv" "${target}-dev" \
         || die "deadsnakes install failed (PPA may not have this Ubuntu release yet). Install pyenv and a 3.10-3.13 build manually, then re-run."
 }
 
@@ -113,10 +141,10 @@ setup_python_env() {
     local req_file="${INSTALL_DIR}/python/requirements.txt"
     as_user "source '${VENV_DIR}/bin/activate' && pip install --upgrade pip -q"
     if [[ -f "$req_file" ]]; then
-        as_user "source '${VENV_DIR}/bin/activate' && pip install -q -r '${req_file}'"
+        with_heartbeat "pip install requirements" as_user "source '${VENV_DIR}/bin/activate' && pip install -q -r '${req_file}'"
     else
         warn "No requirements.txt at ${req_file}, installing numpy directly."
-        as_user "source '${VENV_DIR}/bin/activate' && pip install -q numpy"
+        with_heartbeat "pip install numpy" as_user "source '${VENV_DIR}/bin/activate' && pip install -q numpy"
     fi
 }
 
@@ -155,7 +183,8 @@ do_install() {
     local deps_script="${INSTALL_DIR}/install_dependencies/install_openvino_dependencies.sh"
     if [[ -x "$deps_script" ]]; then
         log "Installing system dependencies..."
-        "$deps_script" -y || warn "Dependency script reported issues; continuing."
+        with_heartbeat "OpenVINO dependency install" "$deps_script" -y \
+            || warn "Dependency script reported issues; continuing."
     else
         warn "No dependency script found at ${deps_script}, skipping."
     fi
@@ -249,7 +278,8 @@ do_ovms_install() {
     # Best-effort: Ubuntu 26.04 may have renamed/dropped this package
     # (bumped past what's in the repo). Not load-bearing — ovms_repair_libs
     # checks the actual binary via ldd and patches from a container if needed.
-    apt-get install -y libxml2 curl || warn "libxml2 not available via apt on this release — will patch via ovms_repair_libs instead."
+    with_heartbeat "apt-get install libxml2/curl" apt-get install -y libxml2 curl \
+        || warn "libxml2 not available via apt on this release — will patch via ovms_repair_libs instead."
 
     if [[ -d "$OVMS_INSTALL_DIR" ]]; then
         log "Existing OVMS found, backing up to ${OVMS_INSTALL_DIR}.bak"
@@ -316,6 +346,7 @@ ovms_repair_libs() {
     # this resolves that in one shot instead of needing a second repair pass.
     log "Resolving full dependency closure via a throwaway ubuntu:24.04 container..."
     local want="${missing[*]}"
+    with_heartbeat "docker lib-repair container" \
     docker run --rm -v "${OVMS_LIB}:/out" ubuntu:24.04 bash -c "
         set -e
         apt-get update -qq
@@ -409,6 +440,81 @@ suggest_task() {
         *rerank*) echo "rerank" ;;
         *)        echo "text_generation" ;;
     esac
+}
+
+# Fetches the list of .gguf filenames a HF repo actually hosts. We build a
+# direct download URL from source_model + gguf_filename, so guessing wrong
+# here means a guaranteed 404 (and OVMS has been observed to segfault on
+# that error path rather than fail cleanly — so this check isn't optional).
+hf_gguf_files() {
+    local repo="$1"
+    local py="${WORK_DIR}/hf_files.py"
+    cat > "$py" <<'PYEOF'
+import sys, json, urllib.request, urllib.parse
+
+repo = sys.argv[1]
+url = "https://huggingface.co/api/models/" + urllib.parse.quote(repo)
+try:
+    with urllib.request.urlopen(url, timeout=15) as r:
+        data = json.load(r)
+except Exception as e:
+    print(f"ERROR:{e}", file=sys.stderr)
+    sys.exit(1)
+
+for s in data.get("siblings", []):
+    fn = s.get("rfilename", "")
+    if fn.lower().endswith(".gguf"):
+        print(fn)
+PYEOF
+    python3 "$py" "$repo"
+}
+
+# Given a repo's real .gguf file list, resolves which exact filename to use
+# as --gguf_filename. Auto-picks if there's only one; otherwise shows a
+# picker, flagging whichever remote name shares a quant tag (Q8_0, etc.)
+# with the local file. Sets SELECTED_GGUF_FILENAME. Returns 1 if the repo
+# hosts no .gguf files at all (caller should treat that as "wrong repo").
+pick_remote_gguf_filename() {
+    local repo="$1" local_hint="$2"
+    local files
+    files="$(hf_gguf_files "$repo" 2>&1)"
+    if [[ "$files" == ERROR:* ]]; then
+        warn "Couldn't list files for ${repo}: ${files#ERROR:}"
+        return 1
+    fi
+    if [[ -z "$files" ]]; then
+        warn "${repo} doesn't host any .gguf files — wrong repo for this file."
+        return 1
+    fi
+
+    local -a arr=()
+    local n=0 f
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        n=$((n + 1))
+        arr[$n]="$f"
+    done <<< "$files"
+
+    if [[ $n -eq 1 ]]; then
+        SELECTED_GGUF_FILENAME="${arr[1]}"
+        log "Using ${SELECTED_GGUF_FILENAME} (only .gguf file in that repo)."
+        return 0
+    fi
+
+    local quant
+    quant="$(grep -oE '[Qq][0-9]_[0-9A-Za-z_]+|IQ[0-9]_[0-9A-Za-z_]+|[Ff]16|[Bb]f16|[Ff]p16' <<< "$local_hint" | head -1)"
+
+    echo
+    echo "Multiple .gguf files in ${repo} — which matches your local file?"
+    local i
+    for ((i = 1; i <= n; i++)); do
+        local mark=""
+        [[ -n "$quant" && "${arr[$i]}" == *"$quant"* ]] && mark="   <-- matches local quant (${quant})"
+        printf '%-4s %s%s\n' "$i" "${arr[$i]}" "$mark"
+    done
+    read -r -p "Pick a number (or blank to cancel): " pick
+    [[ -n "$pick" && -n "${arr[$pick]:-}" ]] || { warn "Cancelled."; return 1; }
+    SELECTED_GGUF_FILENAME="${arr[$pick]}"
 }
 
 # Runs hf_search, prints a numbered table, and lets the person pick one.
@@ -545,7 +651,8 @@ do_model_pull() {
     model_name="${model_name:-${src_model##*/}}"
     read -r -p "Target device [GPU]: " device
     device="${device:-GPU}"
-    case "$device" in CPU|GPU|NPU|AUTO) ;; *) warn "Unusual device '${device}' — continuing anyway." ;; esac
+    device="${device^^}"
+    case "$device" in CPU|GPU|NPU|HETERO|AUTO) ;; *) warn "Unusual device '${device}' — continuing anyway." ;; esac
     read -r -p "Task [${task}]: " task_in
     task="${task_in:-$task}"
 
@@ -554,6 +661,11 @@ do_model_pull() {
         read -r -p "Weight format (int8/int4/fp16) [int8]: " wf
         wf="${wf:-int8}"
         extra="--weight-format ${wf}"
+        echo
+        warn "optimum-cli conversion quantizes the model locally — this is real"
+        warn "CPU/GPU work, not a download, and can run for a long time (minutes"
+        warn "to several hours depending on model size). You'll get a heartbeat"
+        warn "line every 30s even if OVMS itself goes quiet."
     fi
 
     echo
@@ -567,11 +679,13 @@ do_model_pull() {
     [[ "${go,,}" == "n" ]] && { warn "Cancelled."; return 1; }
 
     log "Pulling ${src_model} -> ${MODEL_REPO_DIR}/${model_name}..."
-    ovms_run "--pull --source_model \"${src_model}\" --model_repository_path \"${MODEL_REPO_DIR}\" --model_name \"${model_name}\" --target_device \"${device}\" --task \"${task}\" ${extra}"
+    with_heartbeat "pull/convert ${model_name}" ovms_run "--pull --source_model \"${src_model}\" --model_repository_path \"${MODEL_REPO_DIR}\" --model_name \"${model_name}\" --target_device \"${device}\" --task \"${task}\" ${extra}" \
+        || die "Pull failed (see OVMS output above) — not registering."
 
     read -r -p "Register in ${OVMS_CONFIG_PATH} for multi-model serving? [Y/n] " reg
     if [[ "${reg,,}" != "n" ]]; then
-        ovms_run "--add_to_config --config_path \"${OVMS_CONFIG_PATH}\" --model_name \"${model_name}\" --model_path \"${MODEL_REPO_DIR}/${model_name}\""
+        ovms_run "--add_to_config --config_path \"${OVMS_CONFIG_PATH}\" --model_name \"${model_name}\" --model_path \"${MODEL_REPO_DIR}/${model_name}\"" \
+            || die "Registration failed (see OVMS output above)."
         log "Registered. Start the server to serve all registered models."
     fi
 }
@@ -591,7 +705,7 @@ model_scan_paths() {
         "${USER_HOME}/models" \
         "${USER_HOME}/gguf-models" \
         "/opt/models" \
-        "${extra[@]}"
+        "${extra[@]}" | awk '!seen[$0]++'
 }
 
 do_model_scan() {
@@ -601,8 +715,10 @@ do_model_scan() {
     read -r -p "Also scan a custom path? (blank to skip): " custom
     if [[ -n "$custom" ]]; then
         mkdir -p "$OVMS_STATE_DIR"
-        echo "$custom" >> "${OVMS_STATE_DIR}/extra_scan_paths"
-        chown "${REAL_USER}:${REAL_USER}" "${OVMS_STATE_DIR}/extra_scan_paths"
+        if ! grep -qxF "$custom" "${OVMS_STATE_DIR}/extra_scan_paths" 2>/dev/null; then
+            echo "$custom" >> "${OVMS_STATE_DIR}/extra_scan_paths"
+            chown "${REAL_USER}:${REAL_USER}" "${OVMS_STATE_DIR}/extra_scan_paths"
+        fi
     fi
 
     log "Scanning for GGUF files and OpenVINO IR models..."
@@ -689,6 +805,8 @@ do_model_scan() {
 
     read -r -p "Target device [GPU]: " device
     device="${device:-GPU}"
+    device="${device^^}"
+    case "$device" in CPU|GPU|NPU|HETERO|AUTO) ;; *) warn "Unusual device '${device}' — continuing anyway." ;; esac
     read -r -p "Task [text_generation]: " task
     task="${task:-text_generation}"
 
@@ -711,15 +829,25 @@ do_model_scan() {
         fi
 
         echo
-        echo "OVMS needs an HF repo id for this GGUF's tokenizer/chat-template"
-        echo "metadata (weights stay local — this only fetches that small config)."
+        echo "OVMS needs an HF repo id for this GGUF to prepare it for serving."
+        echo "It must be a repo that actually hosts .gguf files (look for"
+        echo "'-GGUF' in the name) — a plain weights repo will 404."
+        echo "NOTE: despite the file already being local, OVMS's --pull has been"
+        echo "observed re-fetching the full weights from that HF repo anyway —"
+        echo "this is NOT confirmed to skip the download. If the repo you pick"
+        echo "hosts a multi-GB file, expect a real download."
+        local remote_gguf_filename=""
         while true; do
             read -r -p "Search Hugging Face for the source model [${guess:-type a search term}]: " term
             term="${term:-$guess}"
             [[ -n "$term" ]] || { warn "Need something to search for."; continue; }
             if hf_search_and_pick "$term" ""; then
-                src_hint="$SELECTED_MODEL"
-                break
+                if pick_remote_gguf_filename "$SELECTED_MODEL" "$(basename "$sel_path")"; then
+                    src_hint="$SELECTED_MODEL"
+                    remote_gguf_filename="$SELECTED_GGUF_FILENAME"
+                    break
+                fi
+                warn "That repo won't work for this file — try a different search."
             fi
             read -r -p "Try another search? [Y/n] " again
             [[ "${again,,}" == "n" ]] && { warn "Skipping this model."; return 1; }
@@ -733,19 +861,17 @@ do_model_scan() {
     echo "    path:    ${dest}"
     echo "    device:  ${device}"
     echo "    task:    ${task}"
-    [[ -n "$src_hint" ]] && echo "    source:  ${src_hint} (tokenizer/config only)"
+    [[ -n "$src_hint" ]] && echo "    source:  ${src_hint} :: ${remote_gguf_filename} (may re-download — see note above)"
     read -r -p "Proceed? [Y/n] " go
     [[ "${go,,}" == "n" ]] && { warn "Cancelled."; return 1; }
 
     if [[ "$sel_type" == "GGUF" ]]; then
-        # This "pulls" against the already-present local file: OVMS skips
-        # re-downloading the weights (they're already at model_path) and
-        # only fetches tokenizer/chat-template metadata from src_hint, then
-        # writes the graph config add_to_config needs.
-        ovms_run "--pull --source_model \"${src_hint}\" --model_repository_path \"${MODEL_REPO_DIR}\" --model_name \"${model_name}\" --target_device \"${device}\" --task \"${task}\" --gguf_filename \"$(basename "$sel_path")\""
+        with_heartbeat "pull ${model_name}" ovms_run "--pull --source_model \"${src_hint}\" --model_repository_path \"${MODEL_REPO_DIR}\" --model_name \"${model_name}\" --target_device \"${device}\" --task \"${task}\" --gguf_filename \"${remote_gguf_filename}\"" \
+            || die "Pull failed (see OVMS output above) — not registering. If a partial/broken entry for '${model_name}' is already in ${OVMS_CONFIG_PATH}, remove it first: ovms --remove_from_config --config_path \"${OVMS_CONFIG_PATH}\" --model_name \"${model_name}\""
     fi
 
-    ovms_run "--add_to_config --config_path \"${OVMS_CONFIG_PATH}\" --model_name \"${model_name}\" --model_path \"${dest}\""
+    ovms_run "--add_to_config --config_path \"${OVMS_CONFIG_PATH}\" --model_name \"${model_name}\" --model_path \"${dest}\"" \
+        || die "Registration failed (see OVMS output above)."
     log "Registered. Start the server to serve all registered models."
 }
 
@@ -812,6 +938,29 @@ do_ovms_status() {
 }
 
 # ---------------------------------------------------------------------
+# OVMS: list / remove registered models (config_all.json management)
+# ---------------------------------------------------------------------
+do_model_list() {
+    [[ -x "$OVMS_BIN" ]] || die "Install OVMS first."
+    [[ -f "$OVMS_CONFIG_PATH" ]] || { warn "No config file at ${OVMS_CONFIG_PATH} yet — nothing registered."; return 1; }
+    ovms_run "--list_models --model_repository_path \"${MODEL_REPO_DIR}\""
+}
+
+do_model_remove() {
+    [[ -x "$OVMS_BIN" ]] || die "Install OVMS first."
+    [[ -f "$OVMS_CONFIG_PATH" ]] || { warn "No config file at ${OVMS_CONFIG_PATH} yet — nothing registered."; return 1; }
+    do_model_list || true
+    echo
+    read -r -p "Model name to remove (exact, as listed above): " name
+    [[ -n "$name" ]] || { warn "Cancelled."; return 1; }
+    read -r -p "Remove '${name}' from ${OVMS_CONFIG_PATH}? [y/N] " go
+    [[ "${go,,}" == "y" ]] || { warn "Cancelled."; return 1; }
+    ovms_run "--remove_from_config --config_path \"${OVMS_CONFIG_PATH}\" --model_name \"${name}\"" \
+        || die "Remove failed (see OVMS output above)."
+    log "Removed '${name}' from the config."
+}
+
+# ---------------------------------------------------------------------
 # Menu
 # ---------------------------------------------------------------------
 show_menu() {
@@ -834,10 +983,12 @@ OpenVINO ${OV_VERSION} / OVMS ${OVMS_VERSION} manager (Ubuntu 26.04)
  10) Start API server
  11) Stop API server
  12) Server status / tail log
+ 13) List registered models
+ 14) Remove a registered model
 
- 13) Exit
+ 15) Exit
 EOF
-    read -r -p "Select an option [1-13]: " choice || { echo; exit 0; }
+    read -r -p "Select an option [1-15]: " choice || { echo; exit 0; }
     case "$choice" in
         1) ( trap cleanup_work_dir EXIT; do_install )                            || warn "Install did not complete — back at menu." ;;
         2) ( trap cleanup_work_dir EXIT; do_uninstall )                          || warn "Uninstall did not complete — back at menu." ;;
@@ -853,7 +1004,9 @@ EOF
         10) ( trap cleanup_work_dir EXIT; do_ovms_start )                        || warn "Server did not start — back at menu." ;;
         11) ( trap cleanup_work_dir EXIT; do_ovms_stop )                         || warn "Stop did not complete — back at menu." ;;
         12) ( trap cleanup_work_dir EXIT; do_ovms_status )                       || warn "Status check failed — back at menu." ;;
-        13) exit 0 ;;
+        13) ( trap cleanup_work_dir EXIT; do_model_list )                        || warn "List failed — back at menu." ;;
+        14) ( trap cleanup_work_dir EXIT; do_model_remove )                      || warn "Remove did not complete — back at menu." ;;
+        15) exit 0 ;;
         *) warn "Invalid option." ;;
     esac
 }
@@ -874,6 +1027,8 @@ case "${1:-}" in
     ovms-start)      do_ovms_start ;;
     ovms-stop)       do_ovms_stop ;;
     ovms-status)     do_ovms_status ;;
+    ovms-list)       do_model_list ;;
+    ovms-remove)     do_model_remove ;;
     "")              while true; do show_menu; done ;;
     *)               die "Unknown argument: $1" ;;
 esac
