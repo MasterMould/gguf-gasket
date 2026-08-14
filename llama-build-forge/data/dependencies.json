@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "ubuntu": {
+    "24.04": {
+      "base": ["build-essential", "cmake", "git", "pkg-config", "ninja-build"],
+      "vulkan": ["libvulkan-dev", "glslc", "spirv-headers", "vulkan-tools"],
+      "opencl": ["ocl-icd-opencl-dev", "opencl-headers", "clinfo"],
+      "cuda": ["nvidia-cuda-toolkit"],
+      "rocm": ["rocm-hip-runtime", "rocm-hip-sdk", "rocminfo"],
+      "sycl": []
+    },
+    "26.04": {
+      "base": ["build-essential", "cmake", "git", "pkg-config", "ninja-build"],
+      "vulkan": ["libvulkan-dev", "glslc", "spirv-headers", "vulkan-tools"],
+      "opencl": ["ocl-icd-opencl-dev", "opencl-headers", "clinfo"],
+      "cuda": ["nvidia-cuda-toolkit"],
+      "rocm": ["rocm-hip-runtime", "rocm-hip-sdk", "rocminfo"],
+      "sycl": []
+    }
+  },
+  "manual": {
+    "cuda": {
+      "label": "NVIDIA CUDA Toolkit + NVIDIA driver",
+      "check": ["nvcc", "nvidia-smi"],
+      "note": "Use NVIDIA's supported CUDA repository/installer for this Ubuntu release; package names vary by CUDA release."
+    },
+    "rocm": {
+      "label": "AMD ROCm + HIP",
+      "check": ["hipcc", "rocminfo"],
+      "note": "Use AMD's ROCm repository/installer for this Ubuntu release and GPU architecture."
+    },
+    "sycl": {
+      "label": "Intel oneAPI DPC++ / Level Zero",
+      "check": ["icpx", "sycl-ls"],
+      "note": "Use Intel oneAPI packages for DPC++/SYCL and the Intel GPU runtime/Level Zero packages."
+    }
+  }
+}
