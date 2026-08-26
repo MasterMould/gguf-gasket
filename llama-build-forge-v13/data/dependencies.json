@@ -1,0 +1,38 @@
+{
+  "schema_version": 2,
+  "ubuntu": {
+    "24.04": {
+      "base": ["build-essential", "cmake", "git", "pkg-config", "ninja-build"],
+      "vulkan": ["libvulkan-dev", "glslc", "spirv-headers", "vulkan-tools"],
+      "opencl": ["ocl-icd-opencl-dev", "opencl-headers", "clinfo"],
+      "cuda": ["nvidia-cuda-toolkit"],
+      "rocm": ["rocm", "rocminfo"],
+      "sycl": ["intel-oneapi-compiler-dpcpp-cpp"]
+    },
+    "26.04": {
+      "base": ["build-essential", "cmake", "git", "pkg-config", "ninja-build"],
+      "vulkan": ["libvulkan-dev", "glslc", "spirv-headers", "vulkan-tools"],
+      "opencl": ["ocl-icd-opencl-dev", "opencl-headers", "clinfo"],
+      "cuda": ["nvidia-cuda-toolkit"],
+      "rocm": [],
+      "sycl": ["intel-oneapi-compiler-dpcpp-cpp"]
+    }
+  },
+  "manual": {
+    "cuda": {
+      "label": "NVIDIA CUDA Toolkit + NVIDIA driver",
+      "check": ["nvcc", "nvidia-smi"],
+      "note": "Use NVIDIA's supported CUDA repository/installer for this exact Ubuntu release; package names vary by CUDA release. The forge will not mix releases."
+    },
+    "rocm": {
+      "label": "AMD ROCm + HIP",
+      "check": ["hipcc", "rocminfo"],
+      "note": "For Ubuntu 24.04, use AMD's current ROCm package-manager instructions. For Ubuntu 26.04, the forge refuses to add a 24.04/noble repository because the current AMD native-install documentation does not list 26.04 as a supported Ubuntu target."
+    },
+    "sycl": {
+      "label": "Intel oneAPI DPC++ / Level Zero",
+      "check": ["icpx", "sycl-ls"],
+      "note": "Use Intel's current oneAPI APT package intel-oneapi-compiler-dpcpp-cpp. The forge also detects an existing /opt/intel/oneapi installation and loads setvars.sh automatically for CMake/build steps."
+    }
+  }
+}
