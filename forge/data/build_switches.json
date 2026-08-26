@@ -1,0 +1,452 @@
+{
+  "schema_version": 1,
+  "source": "ggml-org/llama.cpp CMake options; intended to be refreshed against upstream",
+  "switches": [
+    {
+      "name": "CMAKE_BUILD_TYPE",
+      "type": "string",
+      "default": "Release",
+      "description": "Selects the overall CMake build mode. Release is the normal choice for a production llama.cpp build; Debug is useful when diagnosing code or backend faults.",
+      "use_cases": [
+        "release builds",
+        "debugging"
+      ],
+      "example": "-DCMAKE_BUILD_TYPE=Release",
+      "meaningful_description": "Selects the overall CMake build mode. Release is the normal choice for a production llama.cpp build; Debug is useful when diagnosing code or backend faults.",
+      "recommendation": "Release is the normal recommended choice.",
+      "caution": "Use Release for production. Debug builds are slower and larger."
+    },
+    {
+      "name": "GGML_NATIVE",
+      "type": "bool",
+      "default": "ON",
+      "description": "Allows the CPU backend to use instruction sets available on this exact build machine. It can improve host-side performance but makes the resulting binaries less portable to other CPUs.",
+      "use_cases": [
+        "maximum host-local CPU performance"
+      ],
+      "example": "-DGGML_NATIVE=ON",
+      "meaningful_description": "Allows the CPU backend to use instruction sets available on this exact build machine. It can improve host-side performance but makes the resulting binaries less portable to other CPUs.",
+      "recommendation": "Recommended for a machine-specific build; avoid for portable binaries.",
+      "caution": "Do not use when the build will be copied to older or different CPUs."
+    },
+    {
+      "name": "GGML_CPU_ALL_VARIANTS",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Builds multiple CPU variants so a binary can select an appropriate implementation at run time instead of being tied to one CPU target.",
+      "use_cases": [
+        "portable CPU binaries"
+      ],
+      "example": "-DGGML_CPU_ALL_VARIANTS=ON",
+      "meaningful_description": "Builds multiple CPU variants so a binary can select an appropriate implementation at run time instead of being tied to one CPU target.",
+      "recommendation": "Recommended for portable CPU packages, not normally needed for an accelerator-first local build.",
+      "caution": "Increases build size and compile time."
+    },
+    {
+      "name": "GGML_OPENMP",
+      "type": "bool",
+      "default": "ON",
+      "description": "Enables OpenMP support for parallel CPU work. Accelerator builds still contain CPU-side work, so this can matter for preprocessing and fallback operations.",
+      "use_cases": [
+        "CPU throughput"
+      ],
+      "example": "-DGGML_OPENMP=ON",
+      "meaningful_description": "Enables OpenMP support for parallel CPU work. Accelerator builds still contain CPU-side work, so this can matter for preprocessing and fallback operations.",
+      "recommendation": "Normally keep enabled unless a toolchain or deployment forbids OpenMP.",
+      "caution": "Adds OpenMP runtime requirements."
+    },
+    {
+      "name": "GGML_CUDA",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Builds the NVIDIA CUDA backend so supported NVIDIA GPUs can execute llama.cpp workloads through CUDA.",
+      "use_cases": [
+        "NVIDIA GPU inference"
+      ],
+      "example": "-DGGML_CUDA=ON",
+      "meaningful_description": "Builds the NVIDIA CUDA backend so supported NVIDIA GPUs can execute llama.cpp workloads through CUDA.",
+      "recommendation": "Required for native CUDA acceleration.",
+      "caution": "Requires a compatible NVIDIA driver and CUDA toolkit."
+    },
+    {
+      "name": "GGML_CUDA_GRAPHS",
+      "type": "bool",
+      "default": "ON",
+      "description": "Enables CUDA graph execution where llama.cpp can capture repeated GPU work into graphs, reducing launch overhead for suitable workloads.",
+      "use_cases": [
+        "CUDA graph execution where supported"
+      ],
+      "example": "-DGGML_CUDA_GRAPHS=ON",
+      "meaningful_description": "Enables CUDA graph execution where llama.cpp can capture repeated GPU work into graphs, reducing launch overhead for suitable workloads.",
+      "recommendation": "Good default on supported CUDA systems; disable when debugging graph-related issues.",
+      "caution": "Not every workload benefits equally."
+    },
+    {
+      "name": "GGML_CUDA_FA",
+      "type": "bool",
+      "default": "ON",
+      "description": "Compiles CUDA FlashAttention support to accelerate attention operations on supported NVIDIA hardware.",
+      "use_cases": [
+        "attention acceleration"
+      ],
+      "example": "-DGGML_CUDA_FA=ON",
+      "meaningful_description": "Compiles CUDA FlashAttention support to accelerate attention operations on supported NVIDIA hardware.",
+      "recommendation": "Recommended when the CUDA toolchain and GPU support it.",
+      "caution": "Adds CUDA compilation work."
+    },
+    {
+      "name": "GGML_CUDA_FA_ALL_QUANTS",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Adds additional quantised FlashAttention kernel variants beyond the normal set. This trades build time and binary size for broader quantisation coverage.",
+      "use_cases": [
+        "broad quantized attention coverage"
+      ],
+      "example": "-DGGML_CUDA_FA_ALL_QUANTS=ON",
+      "meaningful_description": "Adds additional quantised FlashAttention kernel variants beyond the normal set. This trades build time and binary size for broader quantisation coverage.",
+      "recommendation": "Leave off unless the intended models need the extra kernels.",
+      "caution": "Can substantially increase compilation time."
+    },
+    {
+      "name": "GGML_CUDA_NCCL",
+      "type": "bool",
+      "default": "ON",
+      "description": "Adds NVIDIA NCCL collective communication support for configurations that need fast communication across multiple CUDA devices or distributed workers.",
+      "use_cases": [
+        "multi-GPU / distributed CUDA"
+      ],
+      "example": "-DGGML_CUDA_NCCL=ON",
+      "meaningful_description": "Adds NVIDIA NCCL collective communication support for configurations that need fast communication across multiple CUDA devices or distributed workers.",
+      "recommendation": "Use only when multiple GPUs or distributed execution needs NCCL.",
+      "caution": "Unnecessary for a single-GPU build."
+    },
+    {
+      "name": "GGML_HIP",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Builds the AMD HIP/ROCm backend for supported discrete AMD GPUs.",
+      "use_cases": [
+        "AMD GPU inference"
+      ],
+      "example": "-DGGML_HIP=ON",
+      "meaningful_description": "Builds the AMD HIP/ROCm backend for supported discrete AMD GPUs.",
+      "recommendation": "Recommended for supported discrete AMD GPUs.",
+      "caution": "Do not assume an integrated Radeon is ROCm-capable."
+    },
+    {
+      "name": "GGML_HIP_GRAPHS",
+      "type": "bool",
+      "default": "ON",
+      "description": "Enables HIP graph execution to reduce repeated dispatch overhead on supported ROCm workloads.",
+      "use_cases": [
+        "AMD graph execution"
+      ],
+      "example": "-DGGML_HIP_GRAPHS=ON",
+      "meaningful_description": "Enables HIP graph execution to reduce repeated dispatch overhead on supported ROCm workloads.",
+      "recommendation": "Good candidate after a basic HIP build is verified.",
+      "caution": "Keep off when diagnosing HIP graph issues."
+    },
+    {
+      "name": "GGML_HIP_RCCL",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Adds ROCm RCCL support for collective communication between multiple AMD GPUs or distributed workers.",
+      "use_cases": [
+        "multi-GPU ROCm"
+      ],
+      "example": "-DGGML_HIP_RCCL=ON",
+      "meaningful_description": "Adds ROCm RCCL support for collective communication between multiple AMD GPUs or distributed workers.",
+      "recommendation": "Enable only when multi-GPU communication needs it.",
+      "caution": "Not useful on a single GPU."
+    },
+    {
+      "name": "GGML_HIP_ROCWMMA_FATTN",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Enables rocWMMA-based FlashAttention kernels on supported AMD architectures.",
+      "use_cases": [
+        "supported AMD architectures"
+      ],
+      "example": "-DGGML_HIP_ROCWMMA_FATTN=ON",
+      "meaningful_description": "Enables rocWMMA-based FlashAttention kernels on supported AMD architectures.",
+      "recommendation": "Treat as an architecture-specific optimisation and benchmark it.",
+      "caution": "May not apply to every AMD GPU."
+    },
+    {
+      "name": "GGML_VULKAN",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Builds the cross-vendor Vulkan backend. It is useful when a vendor-native backend is unavailable, unsupported, or when one build should cover several GPU vendors.",
+      "use_cases": [
+        "cross-vendor GPU support",
+        "fallback GPU backend"
+      ],
+      "example": "-DGGML_VULKAN=ON",
+      "meaningful_description": "Builds the cross-vendor Vulkan backend. It is useful when a vendor-native backend is unavailable, unsupported, or when one build should cover several GPU vendors.",
+      "recommendation": "Useful as a portability or alternative backend.",
+      "caution": "Requires working Vulkan development/runtime support."
+    },
+    {
+      "name": "GGML_VULKAN_VALIDATE",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Enables Vulkan validation layers so incorrect API usage and resource problems can be diagnosed during development.",
+      "use_cases": [
+        "debugging Vulkan builds"
+      ],
+      "example": "-DGGML_VULKAN_VALIDATE=ON",
+      "meaningful_description": "Enables Vulkan validation layers so incorrect API usage and resource problems can be diagnosed during development.",
+      "recommendation": "Enable for diagnosis, not normal production builds.",
+      "caution": "Requires Vulkan validation layers."
+    },
+    {
+      "name": "GGML_VULKAN_DEBUG",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Enables additional Vulkan backend debug output intended to help diagnose device and command issues.",
+      "use_cases": [
+        "Vulkan debugging"
+      ],
+      "example": "-DGGML_VULKAN_DEBUG=ON",
+      "meaningful_description": "Enables additional Vulkan backend debug output intended to help diagnose device and command issues.",
+      "recommendation": "Enable temporarily when investigating a Vulkan fault.",
+      "caution": "Produces extra output."
+    },
+    {
+      "name": "GGML_VULKAN_CHECK_RESULTS",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Adds extra checks around Vulkan operation results so backend problems can be detected earlier.",
+      "use_cases": [
+        "backend validation"
+      ],
+      "example": "-DGGML_VULKAN_CHECK_RESULTS=ON",
+      "meaningful_description": "Adds extra checks around Vulkan operation results so backend problems can be detected earlier.",
+      "recommendation": "Useful when validating a new Vulkan device or driver.",
+      "caution": "Adds checking overhead."
+    },
+    {
+      "name": "GGML_SYCL",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Builds the SYCL accelerator backend used by Intel GPU configurations through oneAPI and Level Zero.",
+      "use_cases": [
+        "Intel GPU with oneAPI/SYCL"
+      ],
+      "example": "-DGGML_SYCL=ON",
+      "meaningful_description": "Builds the SYCL accelerator backend used by Intel GPU configurations through oneAPI and Level Zero.",
+      "recommendation": "Recommended for the detected Arc A770 on this machine.",
+      "caution": "Requires a working oneAPI SYCL compiler and Level Zero stack."
+    },
+    {
+      "name": "GGML_SYCL_TARGET",
+      "type": "string",
+      "default": "INTEL",
+      "description": "Selects the SYCL target family expected by the backend. For Intel oneAPI builds this is normally INTEL.",
+      "use_cases": [
+        "Intel SYCL builds"
+      ],
+      "example": "-DGGML_SYCL_TARGET=INTEL",
+      "meaningful_description": "Selects the SYCL target family expected by the backend. For Intel oneAPI builds this is normally INTEL.",
+      "recommendation": "Use INTEL for Intel oneAPI/Arc builds.",
+      "caution": "Do not change casually; it is backend-specific."
+    },
+    {
+      "name": "GGML_SYCL_DEVICE_ARCH",
+      "type": "string",
+      "default": "",
+      "description": "Allows explicit device architecture selection when the SYCL compiler needs a particular target rather than its default device set.",
+      "use_cases": [
+        "explicit accelerator targeting"
+      ],
+      "example": "-DGGML_SYCL_DEVICE_ARCH=...",
+      "meaningful_description": "Allows explicit device architecture selection when the SYCL compiler needs a particular target rather than its default device set.",
+      "recommendation": "Usually leave automatic unless a known device target is required.",
+      "caution": "An incorrect architecture can make the build unusable."
+    },
+    {
+      "name": "GGML_SYCL_F16",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Enables 16-bit floating-point paths in the SYCL backend where supported, potentially reducing memory traffic and improving throughput.",
+      "use_cases": [
+        "supported Intel GPUs"
+      ],
+      "example": "-DGGML_SYCL_F16=ON",
+      "meaningful_description": "Enables 16-bit floating-point paths in the SYCL backend where supported, potentially reducing memory traffic and improving throughput.",
+      "recommendation": "Consider after the base SYCL build is stable and benchmark results justify it.",
+      "caution": "Results depend on model and GPU support."
+    },
+    {
+      "name": "GGML_SYCL_GRAPH",
+      "type": "bool",
+      "default": "ON",
+      "description": "Enables graph execution support in the SYCL backend for repeated accelerator work.",
+      "use_cases": [
+        "Intel graph execution"
+      ],
+      "example": "-DGGML_SYCL_GRAPH=ON",
+      "meaningful_description": "Enables graph execution support in the SYCL backend for repeated accelerator work.",
+      "recommendation": "Good candidate for performance testing after a stable build.",
+      "caution": "Disable when troubleshooting graph behaviour."
+    },
+    {
+      "name": "GGML_SYCL_SUPPORT_LEVEL_ZERO",
+      "type": "bool",
+      "default": "ON",
+      "description": "Enables Intel Level Zero support through the SYCL backend, providing the native low-level path needed for Intel GPU device interaction.",
+      "use_cases": [
+        "Intel GPU"
+      ],
+      "example": "-DGGML_SYCL_SUPPORT_LEVEL_ZERO=ON",
+      "meaningful_description": "Enables Intel Level Zero support through the SYCL backend, providing the native low-level path needed for Intel GPU device interaction.",
+      "recommendation": "Recommended for Intel GPU builds.",
+      "caution": "Requires the Level Zero loader and headers."
+    },
+    {
+      "name": "GGML_SYCL_DNN",
+      "type": "bool",
+      "default": "ON",
+      "description": "Enables oneDNN integration in the SYCL backend for supported accelerated operations.",
+      "use_cases": [
+        "Intel acceleration"
+      ],
+      "example": "-DGGML_SYCL_DNN=ON",
+      "meaningful_description": "Enables oneDNN integration in the SYCL backend for supported accelerated operations.",
+      "recommendation": "Recommended when oneDNN is present and stable.",
+      "caution": "Adds oneDNN dependency and linking complexity."
+    },
+    {
+      "name": "GGML_OPENCL",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Builds the OpenCL backend for accelerators that expose compatible OpenCL devices.",
+      "use_cases": [
+        "OpenCL-compatible accelerators"
+      ],
+      "example": "-DGGML_OPENCL=ON",
+      "meaningful_description": "Builds the OpenCL backend for accelerators that expose compatible OpenCL devices.",
+      "recommendation": "Useful as an alternative backend when OpenCL is the best supported path.",
+      "caution": "Usually prefer a native vendor backend when available."
+    },
+    {
+      "name": "GGML_OPENCL_PROFILING",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Enables OpenCL profiling support so kernel execution timing can be inspected during tuning.",
+      "use_cases": [
+        "OpenCL tuning"
+      ],
+      "example": "-DGGML_OPENCL_PROFILING=ON",
+      "meaningful_description": "Enables OpenCL profiling support so kernel execution timing can be inspected during tuning.",
+      "recommendation": "Use for benchmarking and diagnostics, not always for production.",
+      "caution": "Adds profiling overhead."
+    },
+    {
+      "name": "GGML_OPENCL_EMBED_KERNELS",
+      "type": "bool",
+      "default": "ON",
+      "description": "Embeds OpenCL kernels into the build so the resulting program carries its kernel source/assets rather than relying on separate files.",
+      "use_cases": [
+        "self-contained OpenCL builds"
+      ],
+      "example": "-DGGML_OPENCL_EMBED_KERNELS=ON",
+      "meaningful_description": "Embeds OpenCL kernels into the build so the resulting program carries its kernel source/assets rather than relying on separate files.",
+      "recommendation": "Useful when packaging a portable OpenCL application.",
+      "caution": "Increases binary size."
+    },
+    {
+      "name": "GGML_OPENCL_USE_ADRENO_KERNELS",
+      "type": "bool",
+      "default": "ON",
+      "description": "Enables specialised Adreno OpenCL kernels intended for Qualcomm Adreno devices.",
+      "use_cases": [
+        "Qualcomm/Adreno"
+      ],
+      "example": "-DGGML_OPENCL_USE_ADRENO_KERNELS=ON",
+      "meaningful_description": "Enables specialised Adreno OpenCL kernels intended for Qualcomm Adreno devices.",
+      "recommendation": "Use only when an Adreno accelerator is detected.",
+      "caution": "Not relevant to Intel or AMD PC GPUs."
+    },
+    {
+      "name": "GGML_OPENVINO",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Builds the OpenVINO backend, allowing supported Intel devices and workloads to use the OpenVINO runtime.",
+      "use_cases": [
+        "Intel CPU/GPU/NPU via OpenVINO"
+      ],
+      "example": "-DGGML_OPENVINO=ON",
+      "meaningful_description": "Builds the OpenVINO backend, allowing supported Intel devices and workloads to use the OpenVINO runtime.",
+      "recommendation": "Useful when OpenVINO is the chosen runtime path rather than SYCL.",
+      "caution": "Requires a compatible OpenVINO installation."
+    },
+    {
+      "name": "GGML_RPC",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Builds remote procedure call backend support so work can be delegated to a remote backend service.",
+      "use_cases": [
+        "remote backend execution"
+      ],
+      "example": "-DGGML_RPC=ON",
+      "meaningful_description": "Builds remote procedure call backend support so work can be delegated to a remote backend service.",
+      "recommendation": "Use only when remote execution is part of the design.",
+      "caution": "Adds networking and deployment complexity."
+    },
+    {
+      "name": "GGML_BACKEND_DL",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Builds backends as dynamically loadable components so one installation can load backend libraries at run time.",
+      "use_cases": [
+        "one binary with backend plugins",
+        "heterogeneous deployments"
+      ],
+      "example": "-DGGML_BACKEND_DL=ON",
+      "meaningful_description": "Builds backends as dynamically loadable components so one installation can load backend libraries at run time.",
+      "recommendation": "Useful for a flexible multi-backend deployment.",
+      "caution": "Adds runtime library management complexity."
+    },
+    {
+      "name": "BUILD_SHARED_LIBS",
+      "type": "bool",
+      "default": "OFF",
+      "description": "Requests shared libraries for CMake targets that honour this setting, which is useful for applications that dynamically link against llama.cpp libraries.",
+      "use_cases": [
+        "shared library packaging"
+      ],
+      "example": "-DBUILD_SHARED_LIBS=ON",
+      "meaningful_description": "Requests shared libraries for CMake targets that honour this setting, which is useful for applications that dynamically link against llama.cpp libraries.",
+      "recommendation": "Useful when another application will link to llama.cpp dynamically.",
+      "caution": "May complicate standalone distribution."
+    },
+    {
+      "name": "GGML_BUILD_TESTS",
+      "type": "bool",
+      "default": "ON",
+      "description": "Builds the project test targets used to validate ggml and backend behaviour.",
+      "use_cases": [
+        "CI",
+        "validation"
+      ],
+      "example": "-DGGML_BUILD_TESTS=ON",
+      "meaningful_description": "Builds the project test targets used to validate ggml and backend behaviour.",
+      "recommendation": "Recommended for development; optional for a minimal production build.",
+      "caution": "Adds build time and can expose unrelated test-link dependencies."
+    },
+    {
+      "name": "GGML_BUILD_EXAMPLES",
+      "type": "bool",
+      "default": "ON",
+      "description": "Builds examples and related tools shipped with llama.cpp, including useful command-line utilities.",
+      "use_cases": [
+        "developer builds"
+      ],
+      "example": "-DGGML_BUILD_EXAMPLES=ON",
+      "meaningful_description": "Builds examples and related tools shipped with llama.cpp, including useful command-line utilities.",
+      "recommendation": "Recommended for a development build; optional for a minimal runtime-only package.",
+      "caution": "Adds build time and extra targets."
+    }
+  ]
+}
