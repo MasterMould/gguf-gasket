@@ -1,10 +1,193 @@
-# llama.cpp Build Forge module for LLAMA COMMAND CENTER
+# llama.cpp Build Forge for LLAMA COMMAND CENTER
 
-A drop-in Gasket module that adds a hardware-aware, accelerator-first build workflow for `llama.cpp` to `llama_manager.sh`.
+## Purpose
 
-The module keeps responsibilities separate: **LLAMA COMMAND CENTER owns the outer menu, shared settings, display helpers and parent-manager lifecycle; Build Forge owns accelerator detection, dependency resolution, profile generation, build execution, diagnostics, repair and deployment.**
+This module integrates the hardware-aware llama.cpp Build Forge into LLAMA COMMAND CENTER as an auto-discovered `lib/menu_*.sh` module.
 
-The module is auto-discovered by `llama_manager.sh`. No edit to the main manager is required.
+It is deliberately self-contained. The module includes a working Forge payload, so selecting a Forge function no longer depends on a separately installed Forge directory.
+
+## Install
+
+Copy the complete module directory contents into the Gasket project so that the module file is present at:
+
+`lib/menu_llamaforge.sh`
+
+The preferred deployment is to extract this package at the Gasket project root and preserve the included `forge/` directory next to `lib/`. The module also supports an already-installed Forge at `~/ai_stack/llama-build-forge`.
+
+The existing LLAMA COMMAND CENTER loader described by `MODULE_DEVELOPMENT.md` discovers `lib/menu_*.sh` automatically, so no hard-coded edit to `llama_manager.sh` is required.
+
+## First run
+
+Open `./llama_manager.sh` and choose **llama.cpp Build Forge**.
+
+If no stable Forge exists, the module detects its bundled Forge and offers to install it into:
+
+`~/ai_stack/llama-build-forge`
+
+After that, normal Forge actions run against the stable installation.
+
+## Menu
+
+1. Hardware & backend scan
+2. Dependency resolver
+3. Generate build profiles
+4. Build manager
+5. Guided configuration
+6. Build performance tuning
+7. CMake switch catalogue
+8. Diagnose / auto-repair
+9. Install / update Forge
+10. Configure Forge path
+11. Deploy completed build to Gasket
+12. View module log
+13. Back
+
+## Build workflow
+
+The Forge remains accelerator-first. CPU fallback is disabled by default.
+
+The normal path is:
+
+hardware discovery → dependency resolution → profile generation → configuration → CMake configure → compiler preflight → link/build → diagnosis → bounded auto-repair → verification → deployment.
+
+A build is not deployed unless its manifest records a successful final result.
+
+## Hardware targeting
+
+Mixed-GPU machines are supported. Generated builds retain their target accelerator instead of treating every GPU in the machine as interchangeable.
+
+Examples:
+
+- Intel Arc discrete GPU: Intel SYCL + Level Zero
+- Integrated AMD GPU: optional Vulkan profile when Vulkan is actually available
+- Discrete AMD GPU: HIP/ROCm when the required stack is available
+- NVIDIA GPU: CUDA when the required stack is available
+
+An integrated AMD GPU does not automatically force ROCm installation.
+
+## Dependency handling
+
+Dependency checks are bounded and avoid recursive full-home-directory searches.
+
+The resolver distinguishes:
+
+- installed and usable
+- installed but misconfigured
+- missing but safely installable from configured APT repositories
+- vendor-specific stacks requiring a vendor-supported installation path
+- backend not required for the selected hardware
+
+After an installation step, dependencies are re-scanned and the result is re-evaluated before a build is offered.
+
+## Performance tuning
+
+Build tuning exposes CPU/RAM, Ninja, ccache, native CPU optimisation, unity builds, LTO and parallel job count.
+
+Profiles favour a practical balance rather than consuming every logical processor by default.
+
+## Guided configuration
+
+The Forge's configuration editor is intended to be decision-oriented rather than a raw CMake variable dump.
+
+Each relevant switch can expose:
+
+- current value
+- purpose
+- recommended state
+- use case
+- trade-off or caution
+- example
+
+Backend-defining switches and compiler identity are protected where changing them would invalidate the generated hardware profile.
+
+## Auto-repair
+
+Repair is evidence-driven and bounded.
+
+For linker failures the Forge can inspect the dependency chain, locate local libraries which export missing symbols, update linker/runtime paths, and run a small verification before retrying the complete build.
+
+For compiler instability it can reduce concurrency and disable cache-related variables before retrying.
+
+Every repair attempt is recorded in the build manifest.
+
+## Deployment into Gasket
+
+A completed Forge build can be copied into the Gasket execution directory:
+
+`$BUILD_DIR/bin`
+
+The deployment action:
+
+1. lists only successfully completed builds
+2. shows the selected source payload
+3. backs up the existing Gasket `bin/` directory
+4. copies the complete generated binary/backend payload
+5. verifies expected llama.cpp executables
+6. logs the deployment
+
+The source build directory remains intact.
+
+## Paths
+
+Forge configuration:
+
+`~/ai_stack/llama-forge/`
+
+Stable Forge installation:
+
+`~/ai_stack/llama-build-forge/`
+
+Module log:
+
+`~/ai_stack/llama-forge/module.log`
+
+Detected llama.cpp is taken from the Gasket `INSTALL_DIR` global when generating profiles.
+
+## Troubleshooting
+
+### Forge says not installed
+
+Use **Install / update Forge**. The module includes its own Forge payload and should offer to bootstrap it into the stable path.
+
+### A Forge action returns to the menu immediately
+
+Check the module log and verify that `~/ai_stack/llama-build-forge/bin/llama-forge` exists and is executable.
+
+### A profile is blocked
+
+This is intentional. The profile is missing a required backend dependency or runtime capability. Use the dependency resolver, install the missing supported component, re-scan, and regenerate profiles.
+
+### A build fails
+
+Use **Diagnose / auto-repair**. The Forge preserves the build directory and `build.log`. Repair attempts are bounded and are not silently repeated forever.
+
+## Development
+
+The module follows the LLAMA COMMAND CENTER module contract:
+
+- filename `lib/menu_llamaforge.sh`
+- `MENU_LABEL`, `MENU_FN`, `MENU_COLOR`, `MENU_ORDER`
+- private functions prefixed `_llamaforge_`
+- one public entry point `llamaforge_menu`
+- no `exit` from module code
+- significant actions logged
+- destructive/slow actions confirmed
+- source must be silent
+
+The bundled Forge is kept separate from the Gasket module wrapper so Forge internals can evolve without changing the menu-discovery contract.
+
+## Validation
+
+Before release, validate:
+
+- `bash -n lib/menu_llamaforge.sh`
+- `python3 -m py_compile forge/lib/llama_forge.py`
+- source the module with the core Gasket modules
+- verify metadata and entry point
+- verify bundled Forge bootstrap
+- verify accelerator-only gating
+- verify successful-build-only deployment
+
 
 ---
 
