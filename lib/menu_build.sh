@@ -88,8 +88,8 @@ build_engine() {
     detected_vendor=$(select_gpu_with_override 2>/dev/null | tr -d '[:space:]' || echo "UNKNOWN")
 
     # Map physical hardware probe directly to llama.cpp target backends
-    if lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -iq "AMD"; then
-        target_backend="VULKAN"  # Default AMD to Vulkan (ideal for RX 570 / GCN)
+    if lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -iqE "amd|ati|radeon|ellesmere"; then
+        target_backend="VULKAN"
     elif lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -iq "NVIDIA"; then
         target_backend="CUDA"
     elif lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -iq "Intel"; then
@@ -101,7 +101,7 @@ build_engine() {
         echo -e "${B_YELLOW}⚠️  Could not automatically map acceleration backend to hardware.${NC}"
         echo -e "Enforcing strict policy: 'Never Build CPU Only'."
         echo -e "\nSelect target llama.cpp execution backend:"
-        echo -e "  1) Vulkan  (-DGGML_VULKAN=ON)  --> Recommended for AMD RX 570 / Cross-Vendor"
+        echo -e "  1) Vulkan  (-DGGML_VULKAN=ON)  --> Recommended for AMD RX 570/580 / Cross-Vendor"
         echo -e "  2) CUDA    (-DGGML_CUDA=ON)    --> NVIDIA GPUs"
         echo -e "  3) HIP     (-DGGML_HIP=ON)     --> AMD ROCm platform"
         echo -e "  4) SYCL    (-DGGML_SYCL=ON)    --> Intel Arc / oneAPI"
@@ -124,14 +124,14 @@ build_engine() {
         pkg-config ca-certificates unzip file libfuse2
         libwebkit2gtk-4.1-dev libgtk-3-dev gpg-agent
         software-properties-common ocl-icd-libopencl1
-        build-essential git curl cmake
+        build-essential git curl cmake pciutils
         libcurl4-openssl-dev libssl-dev
     )
 
     # Attach backend-specific runtime packages
     case "$target_backend" in
         "VULKAN")
-            base_pkgs+=(vulkan-tools libvulkan-dev mesa-vulkan-drivers)
+            base_pkgs+=(vulkan-tools libvulkan-dev mesa-vulkan-drivers glslc libshaderc-dev spirv-tools)
             ;;
         "HIP")
             base_pkgs+=(hip-runtime-amd rocblas)
