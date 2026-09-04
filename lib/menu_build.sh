@@ -1,7 +1,5 @@
 #!/bin/bash
 # Menu module — auto-discovered by llama_manager.sh
-# To add this module's entry to the main menu, ensure:
-#   MENU_LABEL, MENU_FN, MENU_COLOR, and MENU_ORDER are set.
 MENU_LABEL="Build AI Engine"
 MENU_FN="build_engine"
 MENU_COLOR="${B_CYAN}"
@@ -19,7 +17,7 @@ install_to_path() {
 
     local installed_any=0
     for binary in llama-cli llama-server; do
-        local src="$BUILD_DIR/bin/$binary"
+        local src="$INSTALL_DIR/build/bin/$binary"
         local dst="$bin_dir/$binary"
         if [[ ! -f "$src" ]]; then
             WARN "  $binary not found at $src — skipping."
@@ -48,7 +46,7 @@ install_to_path() {
 
     export PATH="$bin_dir:$PATH"
 
-    # Intel SYCL: persist oneAPI runtime lib paths so binaries work outside the script
+    # Intel SYCL: persist oneAPI runtime lib paths
     local _sycl_lib _mkl_lib
     _sycl_lib=$(find /opt/intel/oneapi/compiler -name "libsycl.so" -type f 2>/dev/null \
         | sort -rV | head -1 | xargs -r dirname) || true
@@ -73,11 +71,10 @@ install_to_path() {
     OK "llama-cli and llama-server are now available system-wide."
     INFO "  Run: llama-cli --help"
     INFO "  Run: llama-server --help"
-    INFO "  (New terminals will pick this up automatically)"
 }
 
 # ================================================================
-#  SMART BUILD ENGINE
+#  SMART BUILD ENGINE (BACKEND-CENTRIC)
 # ================================================================
 build_engine() {
     draw_header
@@ -86,11 +83,43 @@ build_engine() {
         return
     fi
 
-    local current_gpu
-    current_gpu=$(select_gpu_with_override)
-    echo -e "${B_CYAN}Building AI Engine for $current_gpu...${NC}"
+    local target_backend=""
+    local detected_vendor
+    detected_vendor=$(select_gpu_with_override 2>/dev/null | tr -d '[:space:]' || echo "UNKNOWN")
 
-    # Base packages — libdnnl-dev excluded for Intel (system libdnnl lacks SYCL interop)
+    # Map physical hardware probe directly to llama.cpp target backends
+    if lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -iq "AMD"; then
+        target_backend="VULKAN"  # Default AMD to Vulkan (ideal for RX 570 / GCN)
+    elif lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -iq "NVIDIA"; then
+        target_backend="CUDA"
+    elif lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -iq "Intel"; then
+        target_backend="SYCL"
+    fi
+
+    # OVERRIDE / SELECTION MENU: Explicitly choose llama.cpp backend flags
+    if [[ "$target_backend" != "VULKAN" && "$target_backend" != "CUDA" && "$target_backend" != "HIP" && "$target_backend" != "SYCL" ]]; then
+        echo -e "${B_YELLOW}⚠️  Could not automatically map acceleration backend to hardware.${NC}"
+        echo -e "Enforcing strict policy: 'Never Build CPU Only'."
+        echo -e "\nSelect target llama.cpp execution backend:"
+        echo -e "  1) Vulkan  (-DGGML_VULKAN=ON)  --> Recommended for AMD RX 570 / Cross-Vendor"
+        echo -e "  2) CUDA    (-DGGML_CUDA=ON)    --> NVIDIA GPUs"
+        echo -e "  3) HIP     (-DGGML_HIP=ON)     --> AMD ROCm platform"
+        echo -e "  4) SYCL    (-DGGML_SYCL=ON)    --> Intel Arc / oneAPI"
+        echo -e "  5) Abort Build Sequence"
+        echo ""
+        read -rp "Enter selection [1-5]: " backend_choice
+        case "$backend_choice" in
+            1) target_backend="VULKAN" ;;
+            2) target_backend="CUDA" ;;
+            3) target_backend="HIP" ;;
+            4) target_backend="SYCL" ;;
+            *) echo -e "${B_RED}❌ Build canceled by user request.${NC}"; read -p "Press Enter to return..."; return 1 ;;
+        esac
+    fi
+
+    echo -e "${B_CYAN}Configuring build for llama.cpp Backend: $target_backend...${NC}"
+
+    # Standard base system packages
     local base_pkgs=(
         pkg-config ca-certificates unzip file libfuse2
         libwebkit2gtk-4.1-dev libgtk-3-dev gpg-agent
@@ -98,19 +127,30 @@ build_engine() {
         build-essential git curl cmake
         libcurl4-openssl-dev libssl-dev
     )
-    [[ "$current_gpu" != "INTEL" ]] && base_pkgs+=(libdnnl-dev)
+
+    # Attach backend-specific runtime packages
+    case "$target_backend" in
+        "VULKAN")
+            base_pkgs+=(vulkan-tools libvulkan-dev mesa-vulkan-drivers)
+            ;;
+        "HIP")
+            base_pkgs+=(hip-runtime-amd rocblas)
+            ;;
+    esac
+
+    [[ "$target_backend" != "SYCL" ]] && base_pkgs+=(libdnnl-dev)
 
     sudo apt-get update -qq
     sudo apt-get install -y --no-install-recommends "${base_pkgs[@]}" &>> "$LOG_FILE" || true
 
-    if [[ "$current_gpu" == "INTEL" ]]; then
+    if [[ "$target_backend" == "SYCL" ]]; then
         if dpkg -s libdnnl-dev &>/dev/null 2>&1; then
             INFO "Removing system libdnnl-dev (incompatible with SYCL — using oneAPI dnnl)…"
             sudo apt-get remove -y libdnnl-dev &>> "$LOG_FILE" || true
         fi
     fi
 
-    OK "System packages installed."
+    OK "System dependencies ready."
     mkdir -p "$HOME/ai_stack"
 
     if [ ! -d "$INSTALL_DIR/.git" ]; then
@@ -118,42 +158,45 @@ build_engine() {
             | tee -a "$LOG_FILE" \
             || { echo "Clone failed."; read -p "Press Enter..."; return 1; }
     else
-        echo "Updating existing llama.cpp repo..." | tee -a "$LOG_FILE"
+        echo "Updating existing llama.cpp repository..." | tee -a "$LOG_FILE"
         (cd "$INSTALL_DIR" && git pull) | tee -a "$LOG_FILE" || true
     fi
 
     cd "$INSTALL_DIR" || { echo -e "${B_RED}Cannot cd into $INSTALL_DIR${NC}"; read -p "Press Enter..."; return 1; }
 
+    local rebuild="n"
     if [ -d "build" ]; then
-        read -p "Existing build directory found. Rebuild from scratch? (y/n): " rebuild
+        read -p "Existing build folder found. Rebuild from scratch? (y/n): " rebuild
         [[ "$rebuild" == "y" ]] && rm -rf build
     fi
 
-    mkdir -p build
-    cd build || { echo -e "${B_RED}Cannot cd into build directory${NC}"; read -p "Press Enter..."; return 1; }
-
     local cmake_flags=()
 
-    case $current_gpu in
-        "NVIDIA")
-            install_Nvidia_gpu_drivers
+    # Configure llama.cpp flags based directly on GGML execution targets
+    case "$target_backend" in
+        "VULKAN")
+            echo "Building with Vulkan backend (-DGGML_VULKAN=ON)..." | tee -a "$LOG_FILE"
+            cmake_flags+=("-DGGML_VULKAN=ON" "-DGGML_VULKAN_FLASH_ATTN=ON")
+            ;;
+
+        "CUDA")
+            install_Nvidia_gpu_drivers 2>/dev/null || true
             local arch
             arch=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
                 | tr -d '.' | grep -E '^[0-9]+$' | head -n 1 || true)
             [ -z "$arch" ] && arch="all-major"
-            echo "Using CUDA architecture: $arch" | tee -a "$LOG_FILE"
+            echo "Building with CUDA backend (-DGGML_CUDA=ON, Arch: $arch)..." | tee -a "$LOG_FILE"
             cmake_flags+=("-DGGML_CUDA=ON" "-DCMAKE_CUDA_ARCHITECTURES=$arch")
             ;;
 
-        "AMD")
-            install_AMD_gpu_drivers
-            echo "Optimizing for AMD (Vulkan)..." | tee -a "$LOG_FILE"
-            cmake_flags+=("-DGGML_VULKAN=ON" "-DGGML_VULKAN_FLASH_ATTN=ON")
+        "HIP")
+            echo "Building with HIP/ROCm backend (-DGGML_HIP=ON)..." | tee -a "$LOG_FILE"
+            cmake_flags+=("-DGGML_HIP=ON" "-DCCACHE=OFF")
             ;;
 
-        "INTEL")
-            install_intel_gpu_drivers
-            echo "Optimizing for Intel Arc (SYCL)..." | tee -a "$LOG_FILE"
+        "SYCL")
+            install_intel_gpu_drivers 2>/dev/null || true
+            echo "Building with SYCL backend (-DGGML_SYCL=ON)..." | tee -a "$LOG_FILE"
 
             local ICX_PATH=""
             ICX_PATH=$(command -v icx 2>/dev/null) || true
@@ -175,144 +218,59 @@ build_engine() {
                 local icx_bin_dir
                 icx_bin_dir=$(dirname "$ICX_PATH")
                 export PATH="$icx_bin_dir:$PATH"
-                echo "OneAPI icx confirmed: $ICX_PATH" | tee -a "$LOG_FILE"
-
                 local ICPX_PATH="$icx_bin_dir/icpx"
                 [[ ! -f "$ICPX_PATH" ]] && \
                     ICPX_PATH=$(find /opt/intel/oneapi -name icpx -type f 2>/dev/null | head -1) || true
 
                 if [[ -z "$ICPX_PATH" ]]; then
-                    ERR "icpx not found — oneAPI compiler install may be incomplete."
-                    read -rp "Continue with CPU fallback? (y/n): " sycl_fallback
-                    [[ "${sycl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
+                    ERR "icpx missing — strictly aborting per 'Never Build CPU Only' rule."
+                    read -p "Press Enter to return..."; return 1
                 else
-                    echo "icpx confirmed: $ICPX_PATH" | tee -a "$LOG_FILE"
-                    cmake_flags+=("-DGGML_SYCL=ON")
-                    cmake_flags+=("-DCMAKE_CXX_COMPILER=$ICPX_PATH")
-                    cmake_flags+=("-DCMAKE_C_COMPILER=$ICX_PATH")
+                    cmake_flags+=("-DGGML_SYCL=ON" "-DCMAKE_CXX_COMPILER=$ICPX_PATH" "-DCMAKE_C_COMPILER=$ICX_PATH")
                 fi
 
-                # MKL
                 local MKL_CMAKE_DIR=""
                 MKL_CMAKE_DIR=$(find /opt/intel/oneapi/mkl -name "MKLConfig.cmake" \
                     -type f 2>/dev/null | head -1 | xargs -r dirname) || true
                 if [[ -n "$MKL_CMAKE_DIR" ]]; then
-                    cmake_flags+=("-DMKL_DIR=$MKL_CMAKE_DIR")
-                    cmake_flags+=("-DCMAKE_PREFIX_PATH=/opt/intel/oneapi/mkl/latest")
-                    echo "MKL cmake dir: $MKL_CMAKE_DIR" | tee -a "$LOG_FILE"
-                else
-                    WARN "MKLConfig.cmake not found — intel-oneapi-mkl-devel may not be installed."
-                    read -rp "Continue anyway? cmake will likely fail. (y/n): " mkl_fallback
-                    [[ "${mkl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
+                    cmake_flags+=("-DMKL_DIR=$MKL_CMAKE_DIR" "-DCMAKE_PREFIX_PATH=/opt/intel/oneapi/mkl/latest")
                 fi
-
-                # Compiler lib dir derived from ICX_PATH — version-safe
-                local ICX_VERSION_DIR
-                ICX_VERSION_DIR=$(dirname "$(dirname "$ICX_PATH")")
-                local ONEAPI_LIB_DIR="$ICX_VERSION_DIR/lib"
-                if [[ ! -f "$ONEAPI_LIB_DIR/libsycl.so" ]]; then
-                    [[ -f "$ICX_VERSION_DIR/lib64/libsycl.so" ]] \
-                        && ONEAPI_LIB_DIR="$ICX_VERSION_DIR/lib64" \
-                        || { WARN "libsycl.so not found under $ICX_VERSION_DIR"; ONEAPI_LIB_DIR=""; }
-                fi
-                echo "SYCL lib dir: $ONEAPI_LIB_DIR" | tee -a "$LOG_FILE"
-
-                local MKL_LIB_DIR=""
-                MKL_LIB_DIR=$(find /opt/intel/oneapi/mkl -maxdepth 3 -name "libmkl_core.so" \
-                    -type f 2>/dev/null | sort -rV | head -1 | xargs -r dirname) || true
-
-                # TBB
-                local TBB_ROOT="" TBB_CMAKE_DIR="" TBB_LIB_DIR=""
-                TBB_ROOT=$(find /opt/intel/oneapi/tbb -maxdepth 1 -mindepth 1 \
-                    -type d 2>/dev/null | sort -rV | head -1) || true
-                if [[ -n "$TBB_ROOT" ]]; then
-                    TBB_CMAKE_DIR=$(find "$TBB_ROOT" -name "TBBConfig.cmake" \
-                        -type f 2>/dev/null | head -1 | xargs -r dirname) || true
-                    TBB_LIB_DIR=$(find "$TBB_ROOT/lib" -name "libtbb.so*" \
-                        -type f 2>/dev/null | head -1 | xargs -r dirname) || true
-                fi
-                echo "TBB root: $TBB_ROOT | cmake: $TBB_CMAKE_DIR | lib: $TBB_LIB_DIR" \
-                    | tee -a "$LOG_FILE"
-
-                # ONEAPI_ROOT for cmake SYCL detection
-                local ONEAPI_ROOT_DIR
-                ONEAPI_ROOT_DIR=$(dirname "$(dirname "$ICX_VERSION_DIR")")
-                export ONEAPI_ROOT="$ONEAPI_ROOT_DIR"
-                echo "ONEAPI_ROOT: $ONEAPI_ROOT" | tee -a "$LOG_FILE"
-
-                # CMAKE_LIBRARY_PATH
-                local oneapi_lib_paths=""
-                [[ -n "$ONEAPI_LIB_DIR" ]] && oneapi_lib_paths+="$ONEAPI_LIB_DIR;"
-                [[ -n "$MKL_LIB_DIR"    ]] && oneapi_lib_paths+="$MKL_LIB_DIR;"
-                [[ -n "$TBB_LIB_DIR"    ]] && oneapi_lib_paths+="$TBB_LIB_DIR;"
-                [[ -n "$oneapi_lib_paths" ]] && \
-                    cmake_flags+=("-DCMAKE_LIBRARY_PATH=${oneapi_lib_paths%;}")
-
-                [[ -n "$TBB_CMAKE_DIR" ]] && \
-                    cmake_flags+=("-DTBB_DIR=$TBB_CMAKE_DIR") || \
-                    WARN "TBB cmake config not found — MKL::MKL_SYCL::BLAS may fail."
-
-                # rpath for runtime
-                local rpath_flags=""
-                [[ -n "$ONEAPI_LIB_DIR" ]] && rpath_flags+="-Wl,-rpath,$ONEAPI_LIB_DIR "
-                [[ -n "$MKL_LIB_DIR"    ]] && rpath_flags+="-Wl,-rpath,$MKL_LIB_DIR "
-                [[ -n "$TBB_LIB_DIR"    ]] && rpath_flags+="-Wl,-rpath,$TBB_LIB_DIR "
-                if [[ -n "$rpath_flags" ]]; then
-                    cmake_flags+=("-DCMAKE_SHARED_LINKER_FLAGS=${rpath_flags% }")
-                    cmake_flags+=("-DCMAKE_EXE_LINKER_FLAGS=${rpath_flags% }")
-                fi
-
-                # oneDNN: use oneAPI bundled if available, else suppress system one
-                local DNNL_CMAKE_DIR=""
-                DNNL_CMAKE_DIR=$(find /opt/intel/oneapi -name "dnnlConfig.cmake" \
-                    -o -name "oneapi-dnnl-config.cmake" -o -name "dnnl-config.cmake" \
-                    2>/dev/null | head -1 | xargs -r dirname) || true
-                if [[ -n "$DNNL_CMAKE_DIR" ]]; then
-                    cmake_flags+=("-Ddnnl_DIR=$DNNL_CMAKE_DIR")
-                    echo "oneAPI dnnl dir: $DNNL_CMAKE_DIR" | tee -a "$LOG_FILE"
-                else
-                    cmake_flags+=("-DCMAKE_DISABLE_FIND_PACKAGE_DNNL=ON")
-                    cmake_flags+=("-DCMAKE_DISABLE_FIND_PACKAGE_oneDNN=ON")
-                    WARN "oneAPI dnnl not found — disabling oneDNN (DNNL/oneDNN find suppressed)."
-                fi
-
-                [[ -n "$ONEAPI_LIB_DIR" ]] && export LD_LIBRARY_PATH="$ONEAPI_LIB_DIR:${LD_LIBRARY_PATH:-}"
-                [[ -n "$MKL_LIB_DIR"    ]] && export LD_LIBRARY_PATH="$MKL_LIB_DIR:${LD_LIBRARY_PATH:-}"
-                [[ -n "$TBB_LIB_DIR"    ]] && export LD_LIBRARY_PATH="$TBB_LIB_DIR:${LD_LIBRARY_PATH:-}"
             else
-                echo -e "${B_RED}[!] icx compiler not found. SYCL build will fail.${NC}" | tee -a "$LOG_FILE"
-                read -rp "Continue with CPU fallback? (y/n): " sycl_fallback
-                [[ "${sycl_fallback,,}" != "y" ]] && { read -p "Press Enter..."; return; }
+                ERR "icx compiler not found — strictly aborting per 'Never Build CPU Only' rule."
+                read -p "Press Enter to return..."; return 1
             fi
             ;;
 
         *)
-            echo "No supported GPU found. Building for CPU only." | tee -a "$LOG_FILE"
+            # HARD STOP: Enforce "Never Build CPU Only" policy
+            echo -e "\n${B_RED}❌ Error: Enforced 'Never Build CPU Only' policy. Invalid or unmapped backend target.${NC}" | tee -a "$LOG_FILE"
+            read -p "Press Enter to return..."
+            return 1
             ;;
     esac
 
+    # Common core feature targets
     cmake_flags+=("-DGGML_CURL=ON" "-DGGML_SERVER_SSL=ON")
 
-    echo "CMake flags: ${cmake_flags[*]}" | tee -a "$LOG_FILE"
-    cmake .. "${cmake_flags[@]}" 2>&1 | tee -a "$LOG_FILE" \
-        || { echo "CMake config failed."; read -p "Press Enter..."; return 1; }
-    cmake --build . --config Release -j"$(nproc)" 2>&1 | tee -a "$LOG_FILE" \
-        || { echo "CMake build failed."; read -p "Press Enter..."; return 1; }
+    echo "Executing CMake with backend options: ${cmake_flags[*]}" | tee -a "$LOG_FILE"
+    
+    cmake -B build "${cmake_flags[@]}" 2>&1 | tee -a "$LOG_FILE" \
+        || { echo "CMake configuration failed."; read -p "Press Enter..."; return 1; }
+        
+    cmake --build build --config Release -j"$(nproc)" 2>&1 | tee -a "$LOG_FILE" \
+        || { echo "CMake compilation failed."; read -p "Press Enter..."; return 1; }
 
     rotate_log
 
-    if [ -f "bin/llama-server" ]; then
-        echo -e "
-${B_GREEN}✔ Success: Built for $current_gpu!${NC}"
-        echo -e "${B_YELLOW} Adding $USER to render & video groups…${NC}"
+    if [ -f "build/bin/llama-server" ]; then
+        echo -e "\n${B_GREEN}✔ Success: Built using $target_backend backend!${NC}"
         sudo usermod -aG render "$USER" || true
         sudo usermod -aG video  "$USER" || true
         echo ""
         STEP "Installing binaries to PATH…"
         install_to_path
     else
-        echo -e "
-${B_RED}✖ Build failed. Check logs with option 8.${NC}"
+        echo -e "\n${B_RED}✖ Build failed. Check logs.${NC}"
     fi
     read -p "Press Enter to return..."
 }
