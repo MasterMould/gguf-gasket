@@ -83,6 +83,7 @@ detect_gpu_detailed() {
     local nvidia_gpus=()
     local amd_gpus=()
     local intel_gpus=()
+    local integrated_gpus=()
     
     while IFS= read -r line; do
         if [[ "$line" =~ VGA|3D|Display ]]; then
@@ -93,19 +94,25 @@ detect_gpu_detailed() {
             elif echo "$line" | grep -iqE "Intel.*(Graphics|UHD|Iris|Arc|HD Graphics|DG)"; then
                 intel_gpus+=("$line")
             fi
+            
+            # Identify integrated keywords explicitly
+            if echo "$line" | grep -iqE "integrated|uhd|iris|vega|raphael|cezanne|renoir"; then
+                integrated_gpus+=("$line")
+            fi
         fi
     done <<< "$gpu_info"
     
     echo "NVIDIA:${#nvidia_gpus[@]}"
     echo "AMD:${#amd_gpus[@]}"
     echo "INTEL:${#intel_gpus[@]}"
+    echo "INTEGRATED:${#integrated_gpus[@]}"
     
     for gpu in "${nvidia_gpus[@]}"; do echo "NVIDIA_GPU:$gpu"; done
     for gpu in "${amd_gpus[@]}"; do echo "AMD_GPU:$gpu"; done
     for gpu in "${intel_gpus[@]}"; do echo "INTEL_GPU:$gpu"; done
+    for gpu in "${integrated_gpus[@]}"; do echo "INTEGRATED_GPU:$gpu"; done
 }
 
-# Map physical hardware directly to llama.cpp target backends
 detect_gpu() {
     local profile_override=""
     if [ -d "$PROFILE_DIR" ]; then
@@ -128,9 +135,8 @@ detect_gpu() {
         local override
         override=$(cat "$override_file" 2>/dev/null | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
         case "$override" in
-            VULKAN|CUDA|HIP|SYCL|AMD|NVIDIA|INTEL)
-                # Convert vendor tags to backend defaults
-                [[ "$override" == "AMD" ]] && override="VULKAN"
+            VULKAN|CUDA|HIP|SYCL|AMD|NVIDIA|INTEL|IGPU)
+                [[ "$override" == "AMD" || "$override" == "IGPU" ]] && override="VULKAN"
                 [[ "$override" == "NVIDIA" ]] && override="CUDA"
                 [[ "$override" == "INTEL" ]] && override="SYCL"
                 echo "$override"
@@ -142,7 +148,6 @@ detect_gpu() {
     local gpu_info
     gpu_info=$(lspci 2>/dev/null || true)
     
-    # Priority: NVIDIA (CUDA) > AMD (VULKAN) > Intel (SYCL)
     if echo "$gpu_info" | grep -iq "NVIDIA"; then
         echo "CUDA"
         return 0
@@ -165,7 +170,6 @@ detect_gpu() {
     echo "UNKNOWN"
 }
 
-# Backend selector interface — UI goes to stderr, return value strictly to stdout
 select_gpu_with_override() {
     local detected
     detected=$(detect_gpu)
@@ -173,10 +177,11 @@ select_gpu_with_override() {
     local details
     details=$(detect_gpu_detailed)
     
-    local nvidia_count amd_count intel_count
+    local nvidia_count amd_count intel_count integrated_count
     nvidia_count=$(echo "$details" | grep "^NVIDIA:" | cut -d: -f2)
     amd_count=$(echo "$details" | grep "^AMD:" | cut -d: -f2)
     intel_count=$(echo "$details" | grep "^INTEL:" | cut -d: -f2)
+    integrated_count=$(echo "$details" | grep "^INTEGRATED:" | cut -d: -f2)
     
     {
         echo ""
@@ -190,13 +195,18 @@ select_gpu_with_override() {
         fi
         
         if [[ $amd_count -gt 0 ]]; then
-            echo -e "  ${B_GREEN}AMD GPUs detected: $amd_count${NC}"
+            echo -e "  ${B_GREEN}AMD Hardware detected: $amd_count${NC}"
             echo "$details" | grep "^AMD_GPU:" | cut -d: -f2- | while read -r gpu; do echo "    → $gpu"; done
         fi
         
         if [[ $intel_count -gt 0 ]]; then
-            echo -e "  ${B_GREEN}Intel GPUs detected: $intel_count${NC}"
+            echo -e "  ${B_GREEN}Intel Hardware detected: $intel_count${NC}"
             echo "$details" | grep "^INTEL_GPU:" | cut -d: -f2- | while read -r gpu; do echo "    → $gpu"; done
+        fi
+        
+        if [[ $integrated_count -gt 0 ]]; then
+            echo -e "  ${B_GREEN}Integrated Graphics detected${NC}"
+            echo "$details" | grep "^INTEGRATED_GPU:" | cut -d: -f2- | while read -r gpu; do echo "    → $gpu"; done
         fi
         
         echo ""
@@ -204,74 +214,60 @@ select_gpu_with_override() {
     } >&2
     
     local override_file="$HOME/ai_stack/gpu_override.txt"
-    local has_profile=0
-    if [ -d "$PROFILE_DIR" ]; then
-        local current_hostname=$(hostname)
-        for profile in "$PROFILE_DIR"/*.profile; do
-            [ -f "$profile" ] || continue
-            source "$profile"
-            if [ "$HOSTNAME" = "$current_hostname" ]; then
-                local pname=$(basename "$profile" .profile)
-                INFO "Device profile active: $pname (Backend: $GPU_TYPE)" >&2
-                has_profile=1
-                break
-            fi
-        done
-    fi
-    
-    if [[ -f "$override_file" ]] && [[ $has_profile -eq 0 ]]; then
-        local current_override
-        current_override=$(cat "$override_file" 2>/dev/null)
-        INFO "Manual override active: $current_override" >&2
-    fi
-    
     local total_gpus=$((nvidia_count + amd_count + intel_count))
     
-    # Prompt user selection if multiple GPUs exist or automatic mapping is ambiguous
-    if [[ $total_gpus -gt 1 ]] || [[ "$detected" == "UNKNOWN" && $total_gpus -gt 0 ]]; then
-        {
-            WARN "Multiple GPUs or ambiguous hardware detected."
-            echo ""
-            echo "  Select GGML Execution Backend:"
-            echo "  1) Use auto-detected ($detected)"
-            echo "  2) Force Vulkan  (-DGGML_VULKAN=ON)  [Recommended for AMD RX 570/580 / Cross-Vendor]"
-            echo "  3) Force CUDA    (-DGGML_CUDA=ON)    [NVIDIA]"
-            echo "  4) Force HIP     (-DGGML_HIP=ON)     [AMD ROCm]"
-            echo "  5) Force SYCL    (-DGGML_SYCL=ON)    [Intel Arc]"
-            echo "  6) Save target as device profile"
-            echo ""
-        } >&2
-        
-        local choice
-        read -r -p "  Select [1-6]: " choice
-        
-        case "$choice" in
-            2) detected="VULKAN"; echo "VULKAN" > "$override_file" ;;
-            3) detected="CUDA"; echo "CUDA" > "$override_file" ;;
-            4) detected="HIP"; echo "HIP" > "$override_file" ;;
-            5) detected="SYCL"; echo "SYCL" > "$override_file" ;;
-            6)
-                echo "" >&2
-                local hostname=$(hostname)
-                read -r -p "  Profile name [${hostname}_profile]: " pname
-                pname="${pname:-${hostname}_profile}"
-                mkdir -p "$PROFILE_DIR"
-                cat > "$PROFILE_DIR/${pname}.profile" << EOF
+    {
+        WARN "Hardware configuration options:"
+        echo ""
+        echo "  Select GGML Execution Backend:"
+        echo "  1) Use auto-detected ($detected)"
+        echo "  2) Force Vulkan       (-DGGML_VULKAN=ON)  [AMD RX / Cross-Vendor / AMD iGPU]"
+        echo "  3) Force CUDA         (-DGGML_CUDA=ON)    [NVIDIA dGPU]"
+        echo "  4) Force HIP          (-DGGML_HIP=ON)     [AMD ROCm]"
+        echo "  5) Force Intel SYCL   (-DGGML_SYCL=ON)    [Intel Arc / Intel Integrated Graphics]"
+        echo "  6) Force Integrated iGPU (Vulkan/SYCL)    [Route processing to processor graphics]"
+        echo "  7) Save target as device profile"
+        echo ""
+    } >&2
+    
+    local choice
+    read -r -p "  Select [1-7]: " choice
+    
+    case "$choice" in
+        2) detected="VULKAN"; echo "VULKAN" > "$override_file" ;;
+        3) detected="CUDA"; echo "CUDA" > "$override_file" ;;
+        4) detected="HIP"; echo "HIP" > "$override_file" ;;
+        5) detected="SYCL"; echo "SYCL" > "$override_file" ;;
+        6) 
+           # Route to SYCL if Intel iGPU is present, otherwise Vulkan for AMD/generic iGPU
+           if [[ $intel_count -gt 0 ]]; then
+               detected="SYCL"
+           else
+               detected="VULKAN"
+           fi
+           echo "$detected" > "$override_file"
+           ;;
+        7)
+            echo "" >&2
+            local hostname=$(hostname)
+            read -r -p "  Profile name [${hostname}_profile]: " pname
+            pname="${pname:-${hostname}_profile}"
+            mkdir -p "$PROFILE_DIR"
+            cat > "$PROFILE_DIR/${pname}.profile" << EOF
 # Device Profile: $pname
 # Created: $(date)
 GPU_TYPE=$detected
 HOSTNAME=$hostname
 CREATED=$(date +%s)
 EOF
-                OK "Created profile: $pname" >&2
-                echo "$detected" > "$override_file"
-                ;;
-            *)
-                rm -f "$override_file" 2>/dev/null || true
-                INFO "Using auto-detected backend: $detected" >&2
-                ;;
-        esac
-    fi
+            OK "Created profile: $pname" >&2
+            echo "$detected" > "$override_file"
+            ;;
+        *)
+            rm -f "$override_file" 2>/dev/null || true
+            INFO "Using auto-detected backend: $detected" >&2
+            ;;
+    esac
     
     {
         echo ""
@@ -282,7 +278,6 @@ EOF
     echo -n "$detected"
 }
 
-# Status display
 show_gpu_status() {
     local detected
     detected=$(detect_gpu)
