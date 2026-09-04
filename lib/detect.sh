@@ -88,7 +88,7 @@ detect_gpu_detailed() {
         if [[ "$line" =~ VGA|3D|Display ]]; then
             if echo "$line" | grep -iq "NVIDIA"; then
                 nvidia_gpus+=("$line")
-            elif echo "$line" | grep -iqE "Advanced Micro Devices|AMD.*Radeon|ATI.*Radeon"; then
+            elif echo "$line" | grep -iqE "amd|ati|radeon|advanced micro devices|ellesmere"; then
                 amd_gpus+=("$line")
             elif echo "$line" | grep -iqE "Intel.*(Graphics|UHD|Iris|Arc|HD Graphics|DG)"; then
                 intel_gpus+=("$line")
@@ -148,7 +148,7 @@ detect_gpu() {
         return 0
     fi
     
-    if echo "$gpu_info" | grep -iqE "(Advanced Micro Devices|AMD|ATI).*Radeon|(AMD|ATI).*(VGA|Display|3D)"; then
+    if echo "$gpu_info" | grep -iqE "amd|ati|radeon|advanced micro devices|ellesmere"; then
         echo "VULKAN"
         return 0
     fi
@@ -234,7 +234,7 @@ select_gpu_with_override() {
             echo ""
             echo "  Select GGML Execution Backend:"
             echo "  1) Use auto-detected ($detected)"
-            echo "  2) Force Vulkan  (-DGGML_VULKAN=ON)  [Recommended for AMD RX 570 / Cross-Vendor]"
+            echo "  2) Force Vulkan  (-DGGML_VULKAN=ON)  [Recommended for AMD RX 570/580 / Cross-Vendor]"
             echo "  3) Force CUDA    (-DGGML_CUDA=ON)    [NVIDIA]"
             echo "  4) Force HIP     (-DGGML_HIP=ON)     [AMD ROCm]"
             echo "  5) Force SYCL    (-DGGML_SYCL=ON)    [Intel Arc]"
