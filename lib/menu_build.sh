@@ -117,6 +117,32 @@ build_engine() {
         esac
     fi
 
+    # Cross-vendor visibility check: a CUDA or HIP binary can ONLY see its
+    # own vendor's devices at runtime — an Intel iGPU is invisible to them
+    # even though detect.sh's Settings → GPU Device picker could otherwise
+    # target it. Vulkan is the only backend here that enumerates a discrete
+    # AMD/NVIDIA card *and* an Intel iGPU together in the same build, so
+    # flag the trade-off instead of silently locking the iGPU out.
+    if [[ "$target_backend" == "CUDA" || "$target_backend" == "HIP" ]]; then
+        local intel_igpu_line
+        intel_igpu_line=$(lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -i "Intel" \
+            | grep -iE "UHD|Iris|HD Graphics|integrated" | head -1)
+        if [[ -n "$intel_igpu_line" ]]; then
+            echo ""
+            WARN "Intel iGPU also detected, but a $target_backend build cannot see it:"
+            echo -e "    → ${intel_igpu_line:0:70}"
+            echo ""
+            echo -e "  1) Keep $target_backend (dGPU only — iGPU stays unreachable)"
+            echo -e "  2) Switch to Vulkan   (sees both the dGPU and this iGPU)"
+            local igpu_choice=""
+            read -rp "  Select [1-2] (default: 1): " igpu_choice
+            if [[ "$igpu_choice" == "2" ]]; then
+                target_backend="VULKAN"
+                INFO "Switched target backend to Vulkan for iGPU visibility."
+            fi
+        fi
+    fi
+
     echo -e "${B_CYAN}Configuring build for llama.cpp Backend: $target_backend...${NC}"
 
     # Standard base system packages
